@@ -815,6 +815,7 @@ func (e *Engine) getContents(w http.ResponseWriter, r *http.Request) {
 }
 
 var tokenRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
+var clipURLRe = regexp.MustCompile(`^api/courses/([0-9a-f]{16})/pronounce/clip/([0-9a-f]{16})/([0-9]{1,2}\.wav|try-[0-9a-f]{16}\.wav)$`)
 var clipRe = regexp.MustCompile(`^[0-9]{1,2}\.wav$|^try-[0-9a-f]{16}\.wav$`)
 
 // saveRecording stores an uploaded recording as 16 kHz mono WAV.
@@ -945,8 +946,10 @@ func (e *Engine) getLexicon(w http.ResponseWriter, r *http.Request) {
 
 func (e *Engine) putLexicon(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Term string `json:"term"`
-		Say  string `json:"say"`
+		Term   string `json:"term"`
+		Say    string `json:"say"`
+		Course string `json:"course"` // with clip: the course whose voice the clip is in
+		Clip   string `json:"clip"`   // the trial clip the owner listened to and approved
 	}
 	if err := decode(r, &in); err != nil {
 		jsonErr(w, http.StatusBadRequest, err.Error())
@@ -956,6 +959,16 @@ func (e *Engine) putLexicon(w http.ResponseWriter, r *http.Request) {
 	if in.Term == "" || in.Say == "" || len(in.Term) > 60 || len(in.Say) > 80 {
 		jsonErr(w, http.StatusBadRequest, "need the word and how to say it")
 		return
+	}
+	// Keep the exact clip they heard, so segments play that and not a fresh guess.
+	if m := clipURLRe.FindStringSubmatch(in.Clip); m != nil {
+		if c, err := e.st.course(r.Context(), m[1]); err == nil && c.Owner == user(r) {
+			src := filepath.Join(e.opt.dataDir, "pron", m[2], m[3])
+			dst := e.lexClip(user(r), c.VoiceID, in.Term, in.Say)
+			if b, err := os.ReadFile(src); err == nil && os.MkdirAll(filepath.Dir(dst), 0o755) == nil {
+				_ = os.WriteFile(dst, b, 0o644)
+			}
+		}
 	}
 	if err := e.st.setLexicon(r.Context(), user(r), in.Term, in.Say); err != nil {
 		jsonErr(w, http.StatusInternalServerError, err.Error())

@@ -2,7 +2,9 @@ package learn
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -708,11 +710,12 @@ func (e *Engine) doVoice(ctx context.Context, j *Job) error {
 	wav := filepath.Join(dir, name+".wav")
 	m4a := filepath.Join(dir, name+".m4a")
 
-	display, speech := paragraphs(g.Script), paragraphs(e.speechFor(ctx, c, g))
+	text, clips := e.speechFor(ctx, c, g)
+	display, speech := paragraphs(g.Script), paragraphs(text)
 	if len(speech) != len(display) {
 		speech = display
 	}
-	r, err := e.opt.speaker.Render(ctx, c.VoiceID, display, speech, wav)
+	r, err := e.opt.speaker.Render(ctx, c.VoiceID, display, speech, clips, wav)
 	if err != nil {
 		if !redo {
 			_ = e.st.setSegmentStatus(context.WithoutCancel(ctx), g.ID, SegScripted)
@@ -1286,21 +1289,63 @@ func (e *Engine) doGrade(ctx context.Context, j *Job) error {
 }
 
 // speechFor: the text to voice — the teacher's hints, then the owner's lexicon, which always wins.
-func (e *Engine) speechFor(ctx context.Context, c *Course, g *Segment) string {
-	lex, _ := e.st.lexicon(ctx, c.Owner)
-	var pron map[string]string
-	if len(g.Pron) > 2 && json.Unmarshal(g.Pron, &pron) == nil {
-		for _, l := range lex {
-			for k := range pron {
-				if strings.EqualFold(k, l.Term) {
-					delete(pron, k)
-				}
+// A lexicon word with an approved clip stays as written and is returned in clips, so the voice plays
+// exactly what the owner picked; the rest are respelled in the text.
+func (e *Engine) speechFor(ctx context.Context, c *Course, g *Segment) (string, map[string]string) {
+	all, _ := e.st.lexicon(ctx, c.Owner)
+	clips := map[string]string{}
+	var lex []LexEntry
+	for _, l := range all {
+		if p := e.ensureClip(ctx, c.Owner, c.VoiceID, l); p != "" {
+			clips[l.Term] = p
+		} else {
+			lex = append(lex, l)
+		}
+	}
+	return e.speechText(c, g, all, lex), clips
+}
+
+// lexClip is where the approved recording of a lexicon word in a voice lives. The spelling is part of
+// the name, so changing it never plays a stale clip.
+func (e *Engine) lexClip(owner, voiceID, term, say string) string {
+	h := func(s string) string { b := sha256.Sum256([]byte(s)); return hex.EncodeToString(b[:])[:16] }
+	return filepath.Join(e.opt.dataDir, "lexicon", h(owner), voiceID, h(strings.ToLower(term)+"|"+say)+".wav")
+}
+
+// ensureClip returns the word's clip in this voice, rendering it from the spelling if the owner chose it
+// in another voice or by typing only.
+func (e *Engine) ensureClip(ctx context.Context, owner, voiceID string, l LexEntry) string {
+	p := e.lexClip(owner, voiceID, l.Term, l.Say)
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	if e.opt.speaker == nil || os.MkdirAll(filepath.Dir(p), 0o755) != nil {
+		return ""
+	}
+	if err := e.opt.speaker.Say(ctx, voiceID, speakable(l.Say), p); err != nil {
+		e.log.Warn().Err(err).Str("term", l.Term).Msg("couldn't render a pronunciation clip; respelling instead")
+		return ""
+	}
+	return p
+}
+
+// speechText always starts from the script as shown. (Early segments stored a spoken copy with the
+// teacher's respellings baked in, e.g. "eh-LAS-tee-oh", which a lexicon entry for "Elastio" could
+// never match.)
+func (e *Engine) speechText(c *Course, g *Segment, all, lex []LexEntry) string {
+	pron := map[string]string{}
+	if len(g.Pron) > 2 {
+		_ = json.Unmarshal(g.Pron, &pron)
+	}
+	for _, l := range all {
+		for k := range pron {
+			if strings.EqualFold(k, l.Term) {
+				delete(pron, k)
 			}
 		}
-		// Lexicon last: a hint like "elastio-stack" -> "elastio stack" must not bring the old word back.
-		return applyLexicon(applyPronunciations(g.Script, pron), lex)
 	}
-	return applyLexicon(g.Speech, lex)
+	// Lexicon last: a hint like "elastio-stack" -> "elastio stack" must not bring the old word back.
+	return applyLexicon(applyPronunciations(g.Script, pron), lex)
 }
 
 func applyLexicon(text string, lex []LexEntry) string {

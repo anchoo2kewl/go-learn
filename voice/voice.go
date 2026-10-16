@@ -39,7 +39,8 @@ type Voice struct {
 
 // Speaker turns text into audio; Transcriber turns audio into text.
 type Speaker interface {
-	Render(ctx context.Context, voiceID string, display, speech []string, outWav string) (*Rendered, error)
+	// clips maps a word to an approved recording of it in this voice, played in place of the model's guess.
+	Render(ctx context.Context, voiceID string, display, speech []string, clips map[string]string, outWav string) (*Rendered, error)
 	Voices(ctx context.Context) ([]Voice, error)
 	Preview(ctx context.Context, voiceID, outWav string) error
 	Pronounce(ctx context.Context, voiceID, recordingWav string, candidates []string, carrier, outDir string) ([]Option, error)
@@ -84,9 +85,9 @@ func (c *Client) post(ctx context.Context, path string, in, out any, timeout tim
 	return json.Unmarshal(body, out)
 }
 
-func (c *Client) Render(ctx context.Context, voiceID string, display, speech []string, outWav string) (*Rendered, error) {
+func (c *Client) Render(ctx context.Context, voiceID string, display, speech []string, clips map[string]string, outWav string) (*Rendered, error) {
 	var r Rendered
-	err := c.post(ctx, "/render", map[string]any{"voice_id": voiceID, "display": display, "speech": speech, "out": outWav}, &r, 20*time.Minute)
+	err := c.post(ctx, "/render", map[string]any{"voice_id": voiceID, "display": display, "speech": speech, "clips": clips, "out": outWav}, &r, 20*time.Minute)
 	return &r, err
 }
 

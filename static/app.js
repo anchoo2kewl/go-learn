@@ -533,7 +533,7 @@
           await api("lexicon/" + encodeURIComponent(word), { method: "DELETE" });
           close(); toast("“" + word + "” is back to the voice's own way of saying it."); return;
         }
-        const r = await api("lexicon", { method: "PUT", body: { term: word, say } });
+        const r = await api("lexicon", { method: "PUT", body: { term: word, say, course: view.id, clip: heard.say === say ? heard.url : "" } });
         close(); toast("Saved. “" + word + "” is now always said as “" + say + "”." + (r.revoicing ? " Re-voicing this segment first (about a minute), then the rest; it switches over by itself." : ""), null, null, 9000);
         if (r.revoicing) player.watchRevoice();
       } catch (e) { toast(e.message); }

@@ -8,7 +8,7 @@ memory back.
 
   GET  /health
   GET  /voices                                     the stock catalogue
-  POST /render     {voice_id, display[], speech[], out}   -> {duration_s, words[], align_score}
+  POST /render     {voice_id, display[], speech[], out, clips?{term: wav}}   -> {duration_s, words[], align_score}
   POST /transcribe {path}                          -> {text}
   POST /preview    {voice_id, out}                 a short sample of the voice
   POST /pronounce  {voice_id, recording, candidates[], outdir, carrier?}  -> {options[]} ranked
@@ -186,15 +186,71 @@ def align(script_words, heard):
     return times, exact / max(1, n)
 
 
+def load_clip(path, sr):
+    """A learner-approved recording of a word in this voice, trimmed, at the voice's sample rate."""
+    import librosa
+
+    y, csr = sf.read(path, dtype="float32", always_2d=False)
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    if sr and csr != sr:
+        y, csr = librosa.resample(y, orig_sr=csr, target_sr=sr), sr
+    y, _ = librosa.effects.trim(y, top_db=35)
+    return y.astype(np.float32), csr
+
+
+def synth_with_clips(voice, text, clips):
+    """Say text, but wherever a word has an approved clip, play that exact clip instead of letting the
+    model guess. The model can say a respelling right on its own and wrong mid-sentence, so the text
+    around each clip is voiced separately and joined with short gaps. A possessive 's is dropped."""
+    import librosa
+
+    if not clips:
+        return synth(voice, text)
+    pat = re.compile(r"(?<![\w])(" + "|".join(re.escape(t) for t in sorted(clips, key=len, reverse=True)) + r")(?:['’]s)?(?![\w])", re.I)
+    lower = {t.lower(): p for t, p in clips.items()}
+    parts, pos = [], 0
+    for m in pat.finditer(text):
+        parts.append(("text", text[pos:m.start()]))
+        parts.append(("clip", lower[m.group(1).lower()]))
+        pos = m.end()
+    parts.append(("text", text[pos:]))
+    if len(parts) == 1:
+        return synth(voice, text)
+    out, sr = [], None
+    for kind, val in parts:
+        if kind == "clip":
+            y, sr = load_clip(val, sr)
+            out.append(y)
+            continue
+        frag = val.strip()
+        if not re.search(r"\w", frag):
+            if out and re.search(r"[.!?]", frag):
+                out.append(None)  # a sentence break: longer pause
+            continue
+        y, sr = synth(voice, frag)
+        y, _ = librosa.effects.trim(y, top_db=40)
+        out.append(y)
+    if sr is None:
+        return synth(voice, text)
+    joined = []
+    for y in out:
+        joined.append(np.zeros(int((0.28 if y is None else 0.07) * sr), dtype=np.float32))
+        if y is not None:
+            joined.append(y)
+    return np.concatenate(joined[1:] or [np.zeros(1, dtype=np.float32)]), sr
+
+
 def render(req):
     voice = catalogue[req["voice_id"]]
     display, speech = req["display"], req.get("speech") or req["display"]
+    clips = {t: p for t, p in (req.get("clips") or {}).items() if Path(p).is_file()}
     pieces, sr = [], None
     for para in speech:
         if not para.strip():
             continue
         with plock.hold(False):  # one paragraph at a time, so urgent requests can cut in
-            audio, sr = synth(voice, para)
+            audio, sr = synth_with_clips(voice, para, clips)
         pieces += [audio, np.zeros(int(PAUSE_S * sr), dtype=np.float32)]
     audio = np.concatenate(pieces)
     sf.write(req["out"], audio, sr)
