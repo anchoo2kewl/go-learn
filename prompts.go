@@ -290,9 +290,9 @@ func answerPrompt(c *Course, i *Interaction, current *Segment, recent []*Segment
 		fmt.Fprintf(&b, "\nThe learner was listening to this segment when they spoke up:\n%q\n", current.Script)
 	}
 	if len(upcoming) > 0 {
-		b.WriteString("\nAlready prepared to play next (summaries):\n")
-		for _, g := range upcoming {
-			fmt.Fprintf(&b, "- %s\n", g.Summary)
+		b.WriteString("\nAlready prepared to play next, in order (numbered):\n")
+		for k, g := range upcoming {
+			fmt.Fprintf(&b, "%d. %s\n", k+1, g.Summary)
 		}
 	}
 	if i.Kind == "checkin" {
@@ -306,8 +306,9 @@ Judge the answer: "correct", "partial" or "wrong".`)
 		b.WriteString(`
 Respond out loud, directly to this, at their level: answer the question, or act on the request. Keep it
 focused (80 to 350 words) and lead back into the course at the end.
-Then decide what happens to the prepared segments: "keep" if they still fit, or "regenerate" if this
-changes direction (they already know it, want more depth, want to switch focus, or are confused).`)
+Then decide which prepared segments this makes wrong or pointless (they already know it, want more depth,
+want to switch focus, or are confused) and list only those numbers in "drop". Keep everything that still
+fits: change only what the feedback touches. Use "replan": "regenerate" only if all of them should go.`)
 	}
 	b.WriteString(`
 Update the learner profile with anything this reveals (as a complete replacement JSON object, under 250
@@ -320,7 +321,7 @@ they asked to focus on a concept that comes later, put its exact title in "next_
 
 Reply with only a JSON object, no prose and no code fences:
 {"title": "short title", "script": "the spoken reply, paragraphs separated by blank lines", "summary": "one sentence",
- "verdict": "", "replan": "keep", "about": "exact concept title", "profile": {}, "mastery": {"concept title": 0.5},
+ "verdict": "", "replan": "keep", "drop": [], "about": "exact concept title", "profile": {}, "mastery": {"concept title": 0.5},
  "notes": [{"concept": "exact concept title or empty", "kind": "gap", "text": "..."}], "known": [], "next_concept": "",
  "pronunciations": {}}`)
 	return b.String()
@@ -370,4 +371,17 @@ exact concept titles (kind: misconception, gap or strength).
 Reply with only a JSON object, no prose and no code fences:
 {"results": [{"i": <the question's i>, "verdict": "correct", "feedback": "..."}],
  "notes": [{"concept": "exact concept title", "kind": "misconception", "text": "..."}]}`
+}
+
+func pronouncePrompt(word, heard string) string {
+	return `A learner is teaching a text-to-speech voice how to say a word. The word as written: "` + word + `".
+They recorded themselves saying it; a speech recogniser heard: "` + heard + `".
+
+Give 6 different respellings that an English text-to-speech voice would read aloud to produce the
+learner's pronunciation. Vary the stress and the vowel sounds. Write them as plain respellings with
+hyphenated syllables and the stressed syllable in capitals (for example "ee-LAS-tee-oh"), and include the
+word as written if it could plausibly be right.
+
+Reply with only a JSON object, no prose and no code fences:
+{"candidates": ["...", "...", "...", "...", "...", "..."]}`
 }

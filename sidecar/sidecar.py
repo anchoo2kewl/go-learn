@@ -41,7 +41,46 @@ PREVIEW_TEXT = (
 )
 
 log = logging.getLogger("sidecar")
-lock = threading.Lock()
+
+
+class PriorityLock:
+    """One MLX job at a time, but interactive requests (a spoken question, a pronunciation, a preview)
+    go ahead of background segment voicing, which only holds the lock one paragraph at a time."""
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.busy = False
+        self.urgent_waiting = 0
+
+    def acquire(self, urgent):
+        with self.cv:
+            if urgent:
+                self.urgent_waiting += 1
+            while self.busy or (not urgent and self.urgent_waiting):
+                self.cv.wait()
+            if urgent:
+                self.urgent_waiting -= 1
+            self.busy = True
+
+    def release(self):
+        with self.cv:
+            self.busy = False
+            self.cv.notify_all()
+
+    def hold(self, urgent):
+        lk = self
+
+        class _Ctx:
+            def __enter__(self):
+                lk.acquire(urgent)
+
+            def __exit__(self, *a):
+                lk.release()
+
+        return _Ctx()
+
+
+plock = PriorityLock()
 models = {}  # repo -> (model, last_used)
 catalogue = {}
 
@@ -67,7 +106,7 @@ def model(repo, kind="tts"):
 def unloader():
     while True:
         time.sleep(60)
-        with lock:
+        with plock.hold(False):
             for repo, (_, used) in list(models.items()):
                 if time.time() - used > IDLE_UNLOAD_S:
                     log.info("unloading %s (idle)", repo)
@@ -152,13 +191,15 @@ def render(req):
     for para in speech:
         if not para.strip():
             continue
-        audio, sr = synth(voice, para)
+        with plock.hold(False):  # one paragraph at a time, so urgent requests can cut in
+            audio, sr = synth(voice, para)
         pieces += [audio, np.zeros(int(PAUSE_S * sr), dtype=np.float32)]
     audio = np.concatenate(pieces)
     sf.write(req["out"], audio, sr)
     script = [(p, w) for p, para in enumerate(display) for w in para.split()]
-    stt = model(STT_MODEL, "stt")
-    result = stt.transcribe(req["out"], chunk_duration=120.0, overlap_duration=15.0)
+    with plock.hold(False):
+        stt = model(STT_MODEL, "stt")
+        result = stt.transcribe(req["out"], chunk_duration=120.0, overlap_duration=15.0)
     times, score = align([w for _, w in script], heard_words(result))
     words = [{"p": p, "w": w, "s": round(s, 3), "e": round(e, 3)} for (p, w), (s, e) in zip(script, times)]
     return {"duration_s": round(len(audio) / sr, 3), "words": words, "align_score": round(score, 4)}
@@ -167,6 +208,54 @@ def render(req):
 def transcribe(req):
     stt = model(STT_MODEL, "stt")
     return {"text": stt.transcribe(req["path"]).text.strip()}
+
+
+def _features(y, sr):
+    import librosa
+
+    y, _ = librosa.effects.trim(y, top_db=30)
+    if sr != 16000:
+        y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+    m = librosa.feature.mfcc(y=y, sr=16000, n_mfcc=20, n_fft=400, hop_length=160)[1:]
+    m = (m - m.mean(axis=1, keepdims=True)) / (m.std(axis=1, keepdims=True) + 1e-6)
+    return m
+
+
+def _distance(a, b):
+    import librosa
+
+    D, wp = librosa.sequence.dtw(X=a, Y=b, metric="cosine")
+    return float(D[-1, -1] / len(wp))
+
+
+def pronounce(req):
+    """Say each candidate spelling in the course voice and rank them by how close they sound to the
+    learner's own recording of the word (MFCC + dynamic time warping)."""
+    voice = catalogue[req["voice_id"]]
+    rec, rsr = sf.read(req["recording"], dtype="float32", always_2d=False)
+    if rec.ndim > 1:
+        rec = rec.mean(axis=1)
+    target = _features(rec, rsr)
+    out = []
+    for i, say in enumerate(req["candidates"]):
+        say = str(say).strip()
+        if not say:
+            continue
+        audio, sr = synth(voice, say)
+        path = str(Path(req["outdir"]) / f"{i}.wav")
+        sf.write(path, audio, sr)
+        dist = _distance(target, _features(audio, sr)) if target.shape[1] > 5 else 0.0
+        out.append({"say": say, "path": path, "distance": round(dist, 4)})
+    out.sort(key=lambda x: x["distance"])
+    return {"options": out}
+
+
+def say(req):
+    """Render a short phrase in a voice (for trying a typed spelling)."""
+    voice = catalogue[req["voice_id"]]
+    audio, sr = synth(voice, req["text"])
+    sf.write(req["out"], audio, sr)
+    return {"ok": True}
 
 
 def preview(req):
@@ -196,14 +285,17 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404, {"error": "not found"})
 
     def do_POST(self):
-        fn = {"/render": render, "/transcribe": transcribe, "/preview": preview}.get(self.path)
+        fn = {"/render": render, "/transcribe": transcribe, "/preview": preview, "/pronounce": pronounce, "/say": say}.get(self.path)
         if not fn:
             return self.reply(404, {"error": "not found"})
         try:
             req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
             t0 = time.time()
-            with lock:
-                out = fn(req)
+            if fn is render:
+                out = fn(req)  # takes the lock per paragraph itself
+            else:
+                with plock.hold(True):
+                    out = fn(req)
             log.info("%s done in %.1fs", self.path, time.time() - t0)
             self.reply(200, out)
         except KeyError as e:

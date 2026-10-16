@@ -146,6 +146,13 @@ var alters = []string{
 	`ALTER TABLE learn_playback ADD COLUMN device TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE learn_interactions ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE learn_courses ADD COLUMN research INTEGER NOT NULL DEFAULT 1`,
+	`ALTER TABLE learn_segments ADD COLUMN pron TEXT NOT NULL DEFAULT '{}'`,
+	`CREATE TABLE IF NOT EXISTS learn_lexicon (
+		owner TEXT NOT NULL,
+		term TEXT NOT NULL,
+		say TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (owner, term))`,
 }
 
 // Course statuses.
@@ -241,6 +248,7 @@ type Segment struct {
 	InteractionID string          `json:"interaction_id"`
 	CreatedAt     string          `json:"created_at"`
 	PlayedAt      string          `json:"played_at"`
+	Pron          json.RawMessage `json:"-"` // the teacher's pronunciation hints for this segment
 }
 
 type Interaction struct {
@@ -502,14 +510,18 @@ func (s *store) updateNode(ctx context.Context, n *Node) error {
 
 // ---- segments ----
 
-const segCols = `id, course_id, ord, kind, node_id, title, script, speech, summary, checkin, concept_done, status, audio_path, duration_ms, words, align_score, voice_id, llm, interaction_id, created_at, played_at`
+// segColsQ: segCols qualified for joins.
+var segColsQ = "s." + strings.ReplaceAll(segCols, ", ", ", s.")
+
+const segCols = `id, course_id, ord, kind, node_id, title, script, speech, summary, checkin, concept_done, status, audio_path, duration_ms, words, align_score, voice_id, llm, interaction_id, created_at, played_at, pron`
 
 func scanSeg(row interface{ Scan(...any) error }) (*Segment, error) {
 	var g Segment
 	var done int
-	var words string
+	var words, pron string
 	err := row.Scan(&g.ID, &g.CourseID, &g.Ord, &g.Kind, &g.NodeID, &g.Title, &g.Script, &g.Speech, &g.Summary, &g.Checkin, &done,
-		&g.Status, &g.AudioPath, &g.DurationMs, &words, &g.AlignScore, &g.VoiceID, &g.LLM, &g.InteractionID, &g.CreatedAt, &g.PlayedAt)
+		&g.Status, &g.AudioPath, &g.DurationMs, &words, &g.AlignScore, &g.VoiceID, &g.LLM, &g.InteractionID, &g.CreatedAt, &g.PlayedAt, &pron)
+	g.Pron = json.RawMessage(pron)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, errNotFound
 	}
@@ -526,9 +538,12 @@ func (s *store) insertSegment(ctx context.Context, g *Segment) error {
 	if len(g.Words) == 0 {
 		g.Words = json.RawMessage("[]")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_segments (`+segCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	if len(g.Pron) == 0 {
+		g.Pron = json.RawMessage("{}")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_segments (`+segCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		g.ID, g.CourseID, g.Ord, g.Kind, g.NodeID, g.Title, g.Script, g.Speech, g.Summary, g.Checkin, b2i(g.ConceptDone), g.Status,
-		g.AudioPath, g.DurationMs, string(g.Words), g.AlignScore, g.VoiceID, g.LLM, g.InteractionID, g.CreatedAt, g.PlayedAt)
+		g.AudioPath, g.DurationMs, string(g.Words), g.AlignScore, g.VoiceID, g.LLM, g.InteractionID, g.CreatedAt, g.PlayedAt, string(g.Pron))
 	return err
 }
 
@@ -975,4 +990,82 @@ func (s *store) rebuild(ctx context.Context, c *Course) (int64, error) {
 		}
 	}
 	return n, nil
+}
+
+// ---- pronunciation lexicon: how the owner wants words said, across all their courses ----
+
+type LexEntry struct {
+	Term      string `json:"term"`
+	Say       string `json:"say"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func (s *store) lexicon(ctx context.Context, owner string) ([]LexEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT term, say, updated_at FROM learn_lexicon WHERE owner=? ORDER BY term COLLATE NOCASE`, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []LexEntry{}
+	for rows.Next() {
+		var l LexEntry
+		if err := rows.Scan(&l.Term, &l.Say, &l.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (s *store) setLexicon(ctx context.Context, owner, term, say string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_lexicon (owner, term, say, updated_at) VALUES (?,?,?,?)
+		ON CONFLICT(owner, term) DO UPDATE SET say=excluded.say, updated_at=excluded.updated_at`, owner, term, say, now())
+	return err
+}
+
+func (s *store) deleteLexicon(ctx context.Context, owner, term string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM learn_lexicon WHERE owner=? AND term=?`, owner, term)
+	return err
+}
+
+// unheardWith: voiced, unheard segments in the owner's courses whose text contains term (case-insensitive).
+func (s *store) unheardWith(ctx context.Context, owner, term string) ([]*Segment, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+segColsQ+` FROM learn_segments s JOIN learn_courses c ON c.id=s.course_id
+		WHERE c.owner=? AND s.status=? AND s.played_at='' AND instr(lower(s.script), lower(?))>0`, owner, SegReady, term)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Segment
+	for rows.Next() {
+		g, err := scanSeg(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// contents: every segment that counts, in order, without the heavy fields.
+func (s *store) contents(ctx context.Context, course string) ([]map[string]any, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, ord, kind, node_id, title, status, played_at, duration_ms, checkin<>'' FROM learn_segments
+		WHERE course_id=? AND status NOT IN (?,?) ORDER BY ord`, course, SegDiscarded, SegFailed)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, kind, node, title, status, played string
+		var ord float64
+		var ms int64
+		var chk bool
+		if err := rows.Scan(&id, &ord, &kind, &node, &title, &status, &played, &ms, &chk); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{"id": id, "ord": ord, "kind": kind, "node_id": node, "title": title, "status": status,
+			"played": played != "", "duration_ms": ms, "checkin": chk})
+	}
+	return out, rows.Err()
 }

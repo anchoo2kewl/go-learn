@@ -248,7 +248,12 @@
       };
       view.show = show;
       for (const [key, label] of tabs) bar.append(h("button", { role: "tab", "data-tab": key, onclick: () => show(key) }, label));
-      body.push(bar, ...tabs.map(([k]) => panes[k]));
+      els.toc = h("nav", { class: "toc", "aria-label": "Contents" });
+      els.tocWrap = h("aside", { class: "tocwrap", id: "tocwrap" },
+        h("div", { class: "spread" }, h("h2", {}, "Contents"), h("button", { class: "quiet small toc-close", onclick: () => document.body.classList.remove("toc-open") }, "Close")),
+        h("p", { class: "muted small", style: "margin:0" }, "Tap to jump there. It grows and changes as you steer; only what's after you changes."), els.toc);
+      body.push(h("button", { class: "toc-open-btn", onclick: () => { document.body.classList.add("toc-open"); renderContents(); } }, "Contents"));
+      body.push(h("div", { class: "course-grid" }, els.tocWrap, h("div", { class: "course-main stack" }, bar, ...tabs.map(([k]) => panes[k]))));
       view.afterRender = () => show(tabs.some(([k]) => k === view.tab) ? view.tab : (tabs.some(([k]) => k === store.get("tab", "listen")) ? store.get("tab", "listen") : "listen"));
     }
     app.replaceChildren(...body);
@@ -257,6 +262,8 @@
     if (c.status === "active") {
       player.attach(view.id, d);
       loadInteractions();
+      renderContents();
+      timers.push(setInterval(renderContents, 15000));
     }
   }
 
@@ -403,6 +410,128 @@
     return h("div", { class: "qa" }, h("div", { class: "spread" },
       h("span", { class: "muted small" }, (i.kind === "checkin" ? "Check-in answer" : "You asked") + (about ? " · " + about : "") + " · " + new Date(i.created_at).toLocaleString()), st),
       h("div", {}, i.text), play);
+  }
+
+  // ---------- contents ----------
+  let contentsBusy = false;
+  async function renderContents() {
+    const box = view && view.els && view.els.toc;
+    if (!box || contentsBusy) return;
+    contentsBusy = true;
+    let items = [];
+    try { items = await api("courses/" + view.id + "/contents"); } catch { contentsBusy = false; return; }
+    contentsBusy = false;
+    const byId = {};
+    view.data.nodes.forEach((n) => (byId[n.id] = n));
+    const cur = player.currentSeg();
+    const groups = [];
+    let last = null;
+    for (const it of items) {
+      const concept = byId[it.node_id], mod = concept && byId[concept.parent_id];
+      const key = mod ? mod.id : "";
+      if (!last || last.key !== key) { last = { key, title: mod ? mod.title : "", items: [] }; groups.push(last); }
+      last.items.push({ ...it, concept: concept ? concept.title : "" });
+    }
+    box.replaceChildren(...groups.map((g) => h("div", { class: "toc-group" },
+      g.title ? h("div", { class: "eyebrow" }, g.title) : null,
+      ...g.items.map((it) => {
+        const now = cur && cur.id === it.id;
+        const state = now ? "now" : it.played ? "heard" : it.status === "ready" ? "ready" : "writing";
+        const icon = { now: "▶", heard: "✓", ready: "•", writing: "…" }[state];
+        return h("button", { class: "toc-item " + state, disabled: it.status !== "ready", title: it.concept,
+          onclick: () => { document.body.classList.remove("toc-open"); player.jumpTo(it.id); } },
+          h("span", { class: "toc-icon", "aria-hidden": "true" }, icon),
+          h("span", { class: "toc-title" }, (it.kind === "answer" ? "Answer: " : it.kind === "feedback" ? "Feedback: " : "") + (it.title || "Untitled")),
+          h("span", { class: "toc-dur muted" }, it.duration_ms ? fmt(it.duration_ms / 1000) : state === "writing" ? "writing" : ""));
+      }))));
+    const nowEl = box.querySelector(".toc-item.now");
+    if (nowEl && !box.dataset.scrolled) { nowEl.scrollIntoView({ block: "center" }); box.dataset.scrolled = "1"; }
+  }
+
+  // ---------- ask from anywhere ----------
+  function openSheet(title, ...content) {
+    document.querySelectorAll(".sheet-overlay").forEach((x) => x.remove());
+    const ov = h("div", { class: "sheet-overlay" },
+      h("div", { class: "sheetbox", role: "dialog", "aria-label": title },
+        h("div", { class: "spread" }, h("h2", {}, title), h("button", { class: "quiet small", onclick: () => ov.remove() }, "Close")), ...content));
+    ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
+    document.body.append(ov);
+    return () => ov.remove();
+  }
+  function openAsk() {
+    if (!view || !view.data || !view.data.can_steer) return;
+    const ta = h("textarea", { placeholder: "Ask, or steer: \"go deeper here\", \"I know this\", \"show me where this is in our code\"…" });
+    const send = h("button", { class: "primary" }, "Send");
+    const close = openSheet("Ask or steer", ta,
+      h("div", { class: "row" }, send, micButton((t) => { ta.value = (ta.value ? ta.value + " " : "") + t; ta.focus(); }),
+        h("span", { class: "muted small" }, "The answer plays next. Only what's after you changes.")));
+    send.onclick = async () => {
+      if (!ta.value.trim()) return;
+      send.disabled = true;
+      try {
+        await api("courses/" + view.id + "/ask", { method: "POST", body: { text: ta.value, kind: "ask", segment_id: player.currentId(), offset_ms: Math.round(audio.currentTime * 1000) } });
+        close(); toast("Got it. Your answer will play next."); loadInteractions();
+      } catch (e) { toast(e.message); send.disabled = false; }
+    };
+    setTimeout(() => ta.focus(), 50);
+  }
+
+  // ---------- teach a pronunciation ----------
+  function teachWord(raw) {
+    const word = raw.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/['’]s$/, "");
+    if (!word) return;
+    const results = h("div", { class: "stack" });
+    const status = h("p", { class: "muted small", style: "margin:0" }, "Tap Record, say the word the way it should sound, then Stop.");
+    let rec = null, chunks = [];
+    const recBtn = h("button", { class: "primary" }, "Record");
+    const typed = h("input", { type: "text", placeholder: "Or type how it sounds, e.g. ee-LAS-tee-oh", autocomplete: "off" });
+    const play = (url) => { const a = new Audio(url); a.play().catch(() => {}); };
+    let close = () => {};
+    const use = async (say) => {
+      try {
+        const r = await api("lexicon", { method: "PUT", body: { term: word, say } });
+        close(); toast("Saved: “" + word + "” will be said as “" + say + "”." + (r.revoicing ? " Re-voicing " + r.revoicing + " upcoming segment" + (r.revoicing > 1 ? "s" : "") + "." : ""));
+      } catch (e) { toast(e.message); }
+    };
+    const option = (o, best) => h("div", { class: "row pron-opt" },
+      h("button", { onclick: () => play(o.url), "aria-label": "Play " + o.say }, "▶"),
+      h("span", { style: "flex:1;min-width:0" }, o.say, best ? h("span", { class: "pill live", style: "margin-left:8px" }, "closest to you") : null),
+      h("button", { class: "small", onclick: () => use(o.say) }, "Use this"));
+    recBtn.onclick = async () => {
+      if (rec && rec.state === "recording") { rec.stop(); return; }
+      if (!navigator.mediaDevices || !window.MediaRecorder) { status.textContent = "Recording needs the HTTPS address. You can still type how it sounds below."; return; }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        chunks = []; rec = new MediaRecorder(stream);
+        rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+        rec.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop());
+          recBtn.textContent = "Record again"; recBtn.classList.remove("rec");
+          status.replaceChildren(h("span", { class: "spinner" }), " Trying spellings in your teacher's voice and matching them to yours (about 20 seconds)…");
+          results.replaceChildren();
+          const fd = new FormData();
+          fd.append("word", word);
+          fd.append("audio", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "word");
+          try {
+            const r = await api("courses/" + view.id + "/pronounce", { method: "POST", body: fd });
+            status.textContent = "Heard: “" + (r.heard || "?") + "”. Listen and pick the one that sounds right.";
+            results.replaceChildren(...r.options.map((o, i) => option(o, i === 0)));
+            if (r.options[0]) play(r.options[0].url);
+          } catch (e) { status.textContent = "That didn't work: " + e.message; }
+        };
+        rec.start(); recBtn.textContent = "Stop"; recBtn.classList.add("rec"); status.textContent = "Listening… say “" + word + "”.";
+      } catch (e) { status.textContent = "Microphone unavailable: " + e.message; }
+    };
+    const tryBtn = h("button", {}, "Try");
+    tryBtn.onclick = async () => {
+      if (!typed.value.trim()) return;
+      tryBtn.disabled = true;
+      try { const r = await api("courses/" + view.id + "/pronounce/try", { method: "POST", body: { say: typed.value } }); results.prepend(option({ say: typed.value.trim(), url: r.url }, false)); play(r.url); }
+      catch (e) { toast(e.message); }
+      tryBtn.disabled = false;
+    };
+    close = openSheet("How do you say “" + word + "”?", status, h("div", { class: "row" }, recBtn), results,
+      h("div", { class: "row", style: "flex-wrap:nowrap" }, typed, tryBtn));
   }
 
   // ---------- mind map ----------
@@ -641,6 +770,16 @@
     const c = d.course;
     const memberInput = h("input", { type: "text", placeholder: "their Tailscale login, e.g. friend@example.com", autocomplete: "off" });
     const members = h("div", { class: "small muted" }, (d.members || []).length ? "Listening: " + d.members.join(", ") : "Not shared yet.");
+    const lexBox = h("div", { class: "field" });
+    const drawLex = async () => {
+      let lex = [];
+      try { lex = await api("lexicon"); } catch {}
+      lexBox.replaceChildren(h("span", { style: "font-weight:500" }, "Pronunciations (all your topics)"),
+        lex.length ? null : h("span", { class: "muted small" }, "None yet. In the transcript, tap “Fix a word”, then the word, and say it."),
+        ...lex.map((l) => h("div", { class: "row small" }, h("b", {}, l.term), "→", h("span", { style: "flex:1" }, l.say),
+          h("button", { class: "quiet small danger", onclick: async () => { await api("lexicon/" + encodeURIComponent(l.term), { method: "DELETE" }); drawLex(); } }, "Remove"))));
+    };
+    drawLex();
     const box = h("details", { class: "panel" }, h("summary", {}, h("b", {}, "Settings")),
       h("div", { class: "field" }, h("span", { style: "font-weight:500" }, "Voice (applies to new segments)"), voicePicker(c.voice_id, "s-voice")),
       providerFields(c.provider, c.model),
@@ -659,6 +798,7 @@
           try { await api("courses/" + c.id + "/rebuild", { method: "POST" }); toast("Re-planning the map" + (c.research ? " from your code and GitHub" : "") + ". New segments follow in a few minutes."); refreshCourse(true); }
           catch (e) { toast(e.message); }
         } }, c.research ? "Rebuild from my code" : "Rebuild the map")),
+      lexBox,
       h("div", { class: "field" }, h("span", { style: "font-weight:500" }, "Share (listen only)"), members,
         h("div", { class: "row", style: "flex-wrap:nowrap" }, memberInput, h("button", { onclick: async () => {
           if (!memberInput.value.trim()) return;
@@ -679,7 +819,14 @@
     view.els.modes = h("div", { class: "modes", role: "group", "aria-label": "How to follow" },
       ...[["both", "Read + listen"], ["listen", "Listen"], ["read", "Read"]].map(([k, l]) => h("button", { "data-mode": k, "aria-pressed": String(mode === k), onclick: () => player.setMode(k) }, l)));
     view.els.reader = h("article", { class: "reader follow" }, h("p", { class: "muted", style: "font-family:var(--font-ui);font-size:0.95rem" }, "Getting the first segment ready…"));
-    return h("section", { class: "stack" }, h("div", { class: "spread" }, h("h2", {}, "Now"), view.els.modes), view.els.reader);
+    const fix = h("button", { class: "quiet small", "aria-pressed": "false" }, "Fix a word");
+    fix.onclick = () => {
+      const on = fix.getAttribute("aria-pressed") !== "true";
+      fix.setAttribute("aria-pressed", String(on)); fix.textContent = on ? "Tap the word to fix" : "Fix a word";
+      view.els.reader.classList.toggle("fixing", on);
+    };
+    view.els.fix = fix;
+    return h("section", { class: "stack" }, h("div", { class: "spread" }, h("h2", {}, "Now"), h("div", { class: "row" }, d.can_steer ? fix : null, view.els.modes)), view.els.reader);
   }
 
   const player = (() => {
@@ -731,7 +878,7 @@
       audio.playbackRate = SPEEDS[speedIdx];
       const at = resumeAt; resumeAt = 0;
       audio.onloadedmetadata = () => { if (at > 0 && at < audio.duration - 1) audio.currentTime = at; audio.playbackRate = SPEEDS[speedIdx]; };
-      renderReader(); renderBar(); setMediaSession();
+      renderReader(); renderBar(); setMediaSession(); renderContents();
       if (view && view.tab === "map") drawMindMap();
       if (autoplay) audio.play().catch(() => {});
     }
@@ -758,7 +905,8 @@
         const g = await api("courses/" + courseId + "/segments/" + segId);
         if (g.status !== "ready") { toast("That answer is still being voiced. It'll play next automatically."); return; }
         await save(cur && cur.id, false);
-        cur = g; resumeAt = 0; load(true); refreshQueueSoon();
+        cur = g; resumeAt = 0; load(mode !== "read"); refreshQueueSoon();
+        if (mode !== "read") save();
         scrollTo({ top: 0, behavior: "smooth" });
       } catch (e) { toast(e.message); }
     }
@@ -915,6 +1063,11 @@
     document.addEventListener("click", (e) => {
       const i = e.target && e.target.dataset && e.target.dataset.i;
       if (i == null || !words[+i]) return;
+      if (view && view.els && view.els.reader && view.els.reader.classList.contains("fixing")) {
+        view.els.fix.click();
+        teachWord(words[+i].w);
+        return;
+      }
       audio.currentTime = words[+i].s + 0.01; userScrolled = false; $("back").hidden = true;
       if (audio.paused && mode !== "read") audio.play().catch(() => {});
     });
@@ -934,6 +1087,7 @@
     $("rew").onclick = () => { audio.currentTime = Math.max(0, audio.currentTime - 15); };
     $("fwd").onclick = () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 15); };
     $("next").onclick = () => advance(!audio.paused);
+    $("ask").onclick = () => openAsk();
     $("speed").textContent = SPEEDS[speedIdx] + "×";
     $("speed").onclick = () => { speedIdx = (speedIdx + 1) % SPEEDS.length; audio.playbackRate = SPEEDS[speedIdx]; store.set("speed", SPEEDS[speedIdx]); $("speed").textContent = SPEEDS[speedIdx] + "×"; };
     let seeking = false;

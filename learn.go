@@ -144,7 +144,17 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 func (e *Engine) worker(ctx context.Context, kinds []string) {
+	health, _ := e.opt.speaker.(interface{ Healthy(context.Context) bool })
 	for ctx.Err() == nil {
+		// Voice jobs wait for the sidecar (it takes a few seconds to start) rather than burn attempts.
+		if kinds[0] == "voice" && health != nil && !health.Healthy(ctx) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
 		j, err := e.st.claim(ctx, kinds)
 		if err != nil {
 			e.log.Error().Err(err).Msg("claim job")
@@ -245,6 +255,7 @@ func (e *Engine) controller(ctx context.Context) {
 		case <-tick.C:
 		case <-prune.C:
 			e.st.pruneJobs(ctx)
+			e.pruneClips()
 		}
 	}
 }
@@ -281,7 +292,7 @@ func (e *Engine) topUp(ctx context.Context) {
 // the fallback provider with a fresh session. It returns the result and whether the session is new.
 func (e *Engine) turn(ctx context.Context, c *Course, name, sessionProv, session string, prompt func(resumed bool) string, out any) (agent.Result, error) {
 	dir := filepath.Join(e.opt.dataDir, "scratch", c.ID)
-	research := c.Research && len(e.opt.researchDirs) > 0 && !strings.HasSuffix(name, "-calibrate")
+	research := c.Research && len(e.opt.researchDirs) > 0 && !strings.HasSuffix(name, "-calibrate") && !strings.HasSuffix(name, "-pron")
 	try := func(provider, model, resume string) (agent.Result, error) {
 		t := agent.Turn{Provider: provider, Model: model, Dir: dir, Prompt: prompt(resume != ""), Resume: resume, Name: name}
 		if research {
@@ -600,6 +611,7 @@ func (e *Engine) doScript(ctx context.Context, j *Job) error {
 		Summary: out.Summary, Checkin: strings.TrimSpace(out.Checkin), Status: SegScripted, LLM: llmLabel(res),
 	}
 	g.Speech = applyPronunciations(g.Script, out.Pronunciations)
+	g.Pron, _ = json.Marshal(out.Pronunciations)
 	if err := e.st.insertSegment(ctx, g); err != nil {
 		return err
 	}
@@ -688,7 +700,7 @@ func (e *Engine) doVoice(ctx context.Context, j *Job) error {
 	}
 	wav := filepath.Join(dir, g.ID+".wav")
 	m4a := filepath.Join(dir, g.ID+".m4a")
-	display, speech := paragraphs(g.Script), paragraphs(g.Speech)
+	display, speech := paragraphs(g.Script), paragraphs(e.speechFor(ctx, c, g))
 	if len(speech) != len(display) {
 		speech = display
 	}
@@ -708,7 +720,8 @@ func (e *Engine) doVoice(ctx context.Context, j *Job) error {
 		return fmt.Errorf("ffmpeg: %v: %s", err, out)
 	}
 	words, _ := json.Marshal(r.Words)
-	g.Status, g.AudioPath, g.DurationMs, g.Words, g.AlignScore, g.VoiceID = SegReady, m4a, int64(r.DurationS*1000), words, r.AlignScore, c.VoiceID
+	rel, _ := filepath.Rel(e.opt.dataDir, m4a)
+	g.Status, g.AudioPath, g.DurationMs, g.Words, g.AlignScore, g.VoiceID = SegReady, rel, int64(r.DurationS*1000), words, r.AlignScore, c.VoiceID
 	// It may have been discarded while it was being voiced.
 	if cur, err := e.st.segment(ctx, g.ID); err == nil && cur.Status == SegDiscarded {
 		os.Remove(m4a)
@@ -729,6 +742,7 @@ type answerOut struct {
 	Summary        string             `json:"summary"`
 	Verdict        string             `json:"verdict"`
 	Replan         string             `json:"replan"`
+	Drop           []int              `json:"drop"`
 	About          string             `json:"about"`
 	Profile        json.RawMessage    `json:"profile"`
 	Mastery        map[string]float64 `json:"mastery"`
@@ -896,7 +910,7 @@ func (e *Engine) doAnswer(ctx context.Context, j *Job) error {
 	if len(recent) > 0 && current != nil && recent[len(recent)-1].ID == current.ID {
 		recent = recent[:len(recent)-1]
 	}
-	upcoming, _ := e.st.segmentsAfter(ctx, c.ID, at, 4)
+	upcoming, _ := e.st.segmentsAfter(ctx, c.ID, at, 8)
 	x, err := e.loadMap(ctx, c)
 	if err != nil {
 		return err
@@ -955,15 +969,32 @@ func (e *Engine) doAnswer(ctx context.Context, j *Job) error {
 	g := &Segment{CourseID: c.ID, Ord: ord, Kind: kind, NodeID: node, Title: out.Title, Script: cleanScript(out.Script), Summary: out.Summary,
 		Status: SegScripted, LLM: llmLabel(res), InteractionID: i.ID}
 	g.Speech = applyPronunciations(g.Script, out.Pronunciations)
+	g.Pron, _ = json.Marshal(out.Pronunciations)
 	if err := e.st.insertSegment(ctx, g); err != nil {
 		return err
 	}
 	if err := e.st.enqueue(ctx, c.ID, "voice", 95, map[string]string{"segment_id": g.ID}); err != nil {
 		return err
 	}
-	if strings.EqualFold(out.Replan, "regenerate") && i.Kind == "ask" {
-		n, _ := e.st.discardAfter(ctx, c.ID, g.Ord, g.ID)
-		e.log.Info().Str("course", c.ID).Int64("discarded", n).Msg("replanning after the learner's input")
+	// Change only what the feedback makes wrong, and only after where the learner is.
+	if i.Kind == "ask" {
+		dropped := 0
+		for _, k := range out.Drop {
+			if k >= 1 && k <= len(upcoming) {
+				u := upcoming[k-1]
+				if cur, err := e.st.segment(ctx, u.ID); err == nil && cur.PlayedAt == "" && cur.Ord > g.Ord && cur.Status != SegDiscarded {
+					_ = e.st.setSegmentStatus(ctx, u.ID, SegDiscarded)
+					dropped++
+				}
+			}
+		}
+		if dropped == 0 && len(out.Drop) == 0 && strings.EqualFold(out.Replan, "regenerate") {
+			n, _ := e.st.discardAfter(ctx, c.ID, g.Ord, g.ID)
+			dropped = int(n)
+		}
+		if dropped > 0 {
+			e.log.Info().Str("course", c.ID).Int("discarded", dropped).Msg("replanning after the learner's input")
+		}
 	}
 
 	// Learn from it.
@@ -1231,6 +1262,78 @@ func (e *Engine) doGrade(ctx context.Context, j *Job) error {
 	q.Score = quizScore(results)
 	q.Status = "done"
 	return e.st.updateQuiz(ctx, q)
+}
+
+// speechFor: the text to voice — the owner's lexicon first (it always wins), then the teacher's hints.
+func (e *Engine) speechFor(ctx context.Context, c *Course, g *Segment) string {
+	lex, _ := e.st.lexicon(ctx, c.Owner)
+	var pron map[string]string
+	if len(g.Pron) > 2 && json.Unmarshal(g.Pron, &pron) == nil {
+		text := applyLexicon(g.Script, lex)
+		for _, l := range lex {
+			for k := range pron {
+				if strings.EqualFold(k, l.Term) {
+					delete(pron, k)
+				}
+			}
+		}
+		return applyPronunciations(text, pron)
+	}
+	return applyLexicon(g.Speech, lex)
+}
+
+func applyLexicon(text string, lex []LexEntry) string {
+	sort.Slice(lex, func(a, b int) bool { return len(lex[a].Term) > len(lex[b].Term) })
+	for _, l := range lex {
+		re, err := regexp.Compile(`(?i)(^|[^\pL\pN])` + regexp.QuoteMeta(l.Term) + `($|[^\pL\pN])`)
+		if err != nil || strings.TrimSpace(l.Say) == "" {
+			continue
+		}
+		text = re.ReplaceAllString(text, "${1}"+strings.ReplaceAll(l.Say, "$", "$$")+"${2}")
+	}
+	return text
+}
+
+// revoice re-voices unheard segments that use term, except the one the owner is on right now.
+func (e *Engine) revoice(ctx context.Context, owner, term string) int {
+	segs, err := e.st.unheardWith(ctx, owner, term)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, g := range segs {
+		c, err := e.st.course(ctx, g.CourseID)
+		if err != nil {
+			continue
+		}
+		if pb, err := e.st.playback(ctx, owner, c.ID); err == nil && pb.SegmentID == g.ID {
+			continue
+		}
+		_ = e.st.setSegmentStatus(ctx, g.ID, SegScripted)
+		_ = e.st.enqueue(ctx, g.CourseID, "voice", 35, map[string]string{"segment_id": g.ID})
+		n++
+	}
+	e.poke()
+	return n
+}
+
+// pruneClips removes pronunciation trial clips older than a day.
+func (e *Engine) pruneClips() {
+	dir := filepath.Join(e.opt.dataDir, "pron")
+	ents, _ := os.ReadDir(dir)
+	for _, d := range ents {
+		if info, err := d.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+			_ = os.RemoveAll(filepath.Join(dir, d.Name()))
+		}
+	}
+}
+
+// audioPath resolves a stored audio path (relative to the data folder; older rows are absolute).
+func (e *Engine) audioPath(p string) string {
+	if p == "" || filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(e.opt.dataDir, p)
 }
 
 // ---- text helpers ----

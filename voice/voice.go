@@ -42,6 +42,8 @@ type Speaker interface {
 	Render(ctx context.Context, voiceID string, display, speech []string, outWav string) (*Rendered, error)
 	Voices(ctx context.Context) ([]Voice, error)
 	Preview(ctx context.Context, voiceID, outWav string) error
+	Pronounce(ctx context.Context, voiceID, recordingWav string, candidates []string, outDir string) ([]Option, error)
+	Say(ctx context.Context, voiceID, text, outWav string) error
 }
 
 type Transcriber interface {
@@ -94,6 +96,27 @@ func (c *Client) Transcribe(ctx context.Context, wavPath string) (string, error)
 	}
 	err := c.post(ctx, "/transcribe", map[string]any{"path": wavPath}, &r, 3*time.Minute)
 	return r.Text, err
+}
+
+// Option is one candidate pronunciation, rendered, with how far it sounds from the learner's recording.
+type Option struct {
+	Say      string  `json:"say"`
+	Path     string  `json:"path"`
+	Distance float64 `json:"distance"`
+}
+
+// Pronounce renders each candidate spelling and ranks them against the learner's recording (closest first).
+func (c *Client) Pronounce(ctx context.Context, voiceID, recordingWav string, candidates []string, outDir string) ([]Option, error) {
+	var r struct {
+		Options []Option `json:"options"`
+	}
+	err := c.post(ctx, "/pronounce", map[string]any{"voice_id": voiceID, "recording": recordingWav, "candidates": candidates, "outdir": outDir}, &r, 5*time.Minute)
+	return r.Options, err
+}
+
+// Say renders a short phrase.
+func (c *Client) Say(ctx context.Context, voiceID, text, outWav string) error {
+	return c.post(ctx, "/say", map[string]any{"voice_id": voiceID, "text": text, "out": outWav}, nil, 2*time.Minute)
 }
 
 func (c *Client) Preview(ctx context.Context, voiceID, outWav string) error {

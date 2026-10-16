@@ -4,12 +4,14 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +60,13 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("GET /api/courses/{id}/interactions", e.course(false, e.listInteractions))
 	mux.HandleFunc("POST /api/courses/{id}/members", e.course(true, e.setMember))
 	mux.HandleFunc("POST /api/courses/{id}/focus", e.course(true, e.setFocus))
+	mux.HandleFunc("GET /api/courses/{id}/contents", e.course(false, e.getContents))
+	mux.HandleFunc("POST /api/courses/{id}/pronounce", e.course(true, e.pronounce))
+	mux.HandleFunc("POST /api/courses/{id}/pronounce/try", e.course(true, e.pronounceTry))
+	mux.HandleFunc("GET /api/courses/{id}/pronounce/clip/{token}/{file}", e.course(true, e.pronounceClip))
+	mux.HandleFunc("GET /api/lexicon", e.authed(e.getLexicon))
+	mux.HandleFunc("PUT /api/lexicon", e.authed(e.putLexicon))
+	mux.HandleFunc("DELETE /api/lexicon/{term}", e.authed(e.deleteLexicon))
 	mux.HandleFunc("GET /api/courses/{id}/notes", e.course(true, e.listNotes))
 	mux.HandleFunc("PATCH /api/courses/{id}/notes/{nid}", e.course(true, e.patchNote))
 	mux.HandleFunc("GET /api/courses/{id}/quizzes", e.course(true, e.listQuizzes))
@@ -448,7 +457,7 @@ func (e *Engine) audio(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := os.Open(g.AudioPath)
+	f, err := os.Open(e.audioPath(g.AudioPath))
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -794,4 +803,171 @@ func (e *Engine) rebuildCourse(w http.ResponseWriter, r *http.Request) {
 	e.poke()
 	e.log.Info().Str("course", c.ID).Int64("discarded", n).Msg("rebuilding the course map")
 	jsonOK(w, map[string]any{"status": StatusPlanning, "discarded": n})
+}
+
+func (e *Engine) getContents(w http.ResponseWriter, r *http.Request) {
+	items, err := e.st.contents(r.Context(), courseOf(r).ID)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonOK(w, items)
+}
+
+var tokenRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
+var clipRe = regexp.MustCompile(`^[0-9]{1,2}\.wav$|^try-[0-9a-f]{16}\.wav$`)
+
+// saveRecording stores an uploaded recording as 16 kHz mono WAV.
+func (e *Engine) saveRecording(r *http.Request, dir string) (string, error) {
+	f, _, err := r.FormFile("audio")
+	if err != nil {
+		return "", errors.New("send the recording as form field 'audio'")
+	}
+	defer f.Close()
+	raw := filepath.Join(dir, "rec.raw")
+	out, err := os.Create(raw)
+	if err != nil {
+		return "", err
+	}
+	_, err = io.Copy(out, f)
+	out.Close()
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(raw)
+	wav := filepath.Join(dir, "rec.wav")
+	if o, err := exec.CommandContext(r.Context(), e.opt.ffmpeg, "-y", "-loglevel", "error", "-i", raw, "-ac", "1", "-ar", "16000", wav).CombinedOutput(); err != nil {
+		return "", errors.New("couldn't read that recording: " + string(o))
+	}
+	return wav, nil
+}
+
+// pronounce: the owner taps a word and says it. We ask for candidate spellings, voice each in the
+// course's voice, and rank them by how close they sound to the recording.
+func (e *Engine) pronounce(w http.ResponseWriter, r *http.Request) {
+	c := courseOf(r)
+	if e.opt.speaker == nil || e.opt.transcriber == nil {
+		jsonErr(w, http.StatusServiceUnavailable, "the voice engine isn't running")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	word := strings.Trim(strings.TrimSpace(r.FormValue("word")), ".,;:!?\"'()[]")
+	if word == "" || len(word) > 60 {
+		jsonErr(w, http.StatusBadRequest, "pick a word first")
+		return
+	}
+	token := newID()
+	dir := filepath.Join(e.opt.dataDir, "pron", token)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
+	defer cancel()
+	wav, err := e.saveRecording(r, dir)
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	heard, _ := e.opt.transcriber.Transcribe(ctx, wav)
+	var out struct {
+		Candidates []string `json:"candidates"`
+	}
+	if _, err := e.turn(ctx, c, "learn-"+c.ID+"-pron", "", "", func(bool) string { return pronouncePrompt(word, heard) }, &out); err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	cands := []string{word}
+	seen := map[string]bool{strings.ToLower(word): true}
+	for _, s := range out.Candidates {
+		s = strings.TrimSpace(s)
+		if s != "" && len(s) < 80 && !seen[strings.ToLower(s)] {
+			seen[strings.ToLower(s)] = true
+			cands = append(cands, s)
+		}
+	}
+	if len(cands) > 7 {
+		cands = cands[:7]
+	}
+	opts, err := e.opt.speaker.Pronounce(ctx, c.VoiceID, wav, cands, dir)
+	if err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	var list []map[string]any
+	for _, o := range opts {
+		list = append(list, map[string]any{"say": o.Say, "distance": o.Distance,
+			"url": "api/courses/" + c.ID + "/pronounce/clip/" + token + "/" + filepath.Base(o.Path)})
+	}
+	jsonOK(w, map[string]any{"word": word, "heard": heard, "options": list, "token": token})
+}
+
+// pronounceTry voices a spelling the owner typed.
+func (e *Engine) pronounceTry(w http.ResponseWriter, r *http.Request) {
+	c := courseOf(r)
+	var in struct {
+		Say string `json:"say"`
+	}
+	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Say) == "" || len(in.Say) > 80 {
+		jsonErr(w, http.StatusBadRequest, "type how it should sound")
+		return
+	}
+	token := newID()
+	dir := filepath.Join(e.opt.dataDir, "pron", token)
+	_ = os.MkdirAll(dir, 0o755)
+	name := "try-" + newID() + ".wav"
+	if err := e.opt.speaker.Say(r.Context(), c.VoiceID, strings.TrimSpace(in.Say), filepath.Join(dir, name)); err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	jsonOK(w, map[string]string{"url": "api/courses/" + c.ID + "/pronounce/clip/" + token + "/" + name})
+}
+
+func (e *Engine) pronounceClip(w http.ResponseWriter, r *http.Request) {
+	token, file := r.PathValue("token"), r.PathValue("file")
+	if !tokenRe.MatchString(token) || !clipRe.MatchString(file) {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "audio/wav")
+	http.ServeFile(w, r, filepath.Join(e.opt.dataDir, "pron", token, file))
+}
+
+func (e *Engine) getLexicon(w http.ResponseWriter, r *http.Request) {
+	l, err := e.st.lexicon(r.Context(), user(r))
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonOK(w, l)
+}
+
+func (e *Engine) putLexicon(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Term string `json:"term"`
+		Say  string `json:"say"`
+	}
+	if err := decode(r, &in); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	in.Term, in.Say = strings.TrimSpace(in.Term), strings.TrimSpace(in.Say)
+	if in.Term == "" || in.Say == "" || len(in.Term) > 60 || len(in.Say) > 80 {
+		jsonErr(w, http.StatusBadRequest, "need the word and how to say it")
+		return
+	}
+	if err := e.st.setLexicon(r.Context(), user(r), in.Term, in.Say); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	n := e.revoice(r.Context(), user(r), in.Term)
+	jsonOK(w, map[string]any{"saved": true, "revoicing": n})
+}
+
+func (e *Engine) deleteLexicon(w http.ResponseWriter, r *http.Request) {
+	if err := e.st.deleteLexicon(r.Context(), user(r), r.PathValue("term")); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonOK(w, map[string]bool{"deleted": true})
 }
