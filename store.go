@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -240,6 +241,7 @@ type Segment struct {
 	ConceptDone   bool            `json:"-"`
 	Status        string          `json:"status"`
 	AudioPath     string          `json:"-"`
+	AudioV        string          `json:"audio_v"` // changes when the segment is re-voiced; busts the browser cache
 	DurationMs    int64           `json:"duration_ms"`
 	Words         json.RawMessage `json:"words,omitempty"`
 	AlignScore    float64         `json:"align_score"`
@@ -527,6 +529,7 @@ func scanSeg(row interface{ Scan(...any) error }) (*Segment, error) {
 	}
 	g.ConceptDone = done != 0
 	g.Words = json.RawMessage(words)
+	g.AudioV = strings.TrimSuffix(filepath.Base(g.AudioPath), ".m4a")
 	return &g, err
 }
 
@@ -890,6 +893,13 @@ func (s *store) enqueue(ctx context.Context, course, kind string, priority int, 
 	return err
 }
 
+// voiceQueued reports whether a re-voice of the segment is already waiting.
+func (s *store) voiceQueued(ctx context.Context, segID string) bool {
+	var n int
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM learn_jobs WHERE kind='voice' AND status='queued' AND json_extract(payload,'$.segment_id')=?`, segID).Scan(&n)
+	return n > 0
+}
+
 func (s *store) hasJob(ctx context.Context, course string, kinds ...string) bool {
 	args := []any{course}
 	for _, k := range kinds {
@@ -1031,7 +1041,7 @@ func (s *store) deleteLexicon(ctx context.Context, owner, term string) error {
 // unheardWith: voiced, unheard segments in the owner's courses whose text contains term (case-insensitive).
 func (s *store) unheardWith(ctx context.Context, owner, term string) ([]*Segment, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+segColsQ+` FROM learn_segments s JOIN learn_courses c ON c.id=s.course_id
-		WHERE c.owner=? AND s.status=? AND s.played_at='' AND instr(lower(s.script), lower(?))>0`, owner, SegReady, term)
+		WHERE c.owner=? AND s.status=? AND s.played_at='' AND instr(lower(s.script), lower(?))>0 ORDER BY s.course_id, s.ord`, owner, SegReady, term)
 	if err != nil {
 		return nil, err
 	}

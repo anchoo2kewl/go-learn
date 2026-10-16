@@ -678,6 +678,7 @@ func (e *Engine) addConcept(ctx context.Context, c *Course, modules, concepts []
 func (e *Engine) doVoice(ctx context.Context, j *Job) error {
 	var p struct {
 		SegmentID string `json:"segment_id"`
+		Redo      bool   `json:"redo"` // re-voice a ready segment (a pronunciation changed); it stays playable meanwhile
 	}
 	if err := json.Unmarshal(j.Payload, &p); err != nil {
 		return err
@@ -686,37 +687,50 @@ func (e *Engine) doVoice(ctx context.Context, j *Job) error {
 	if err != nil {
 		return err
 	}
-	if g.Status != SegScripted {
+	redo := p.Redo && g.Status == SegReady
+	if g.Status != SegScripted && !redo {
 		return nil // discarded or already voiced
 	}
 	c, err := e.st.course(ctx, g.CourseID)
 	if err != nil {
 		return err
 	}
-	_ = e.st.setSegmentStatus(ctx, g.ID, SegVoicing)
+	old := g.AudioPath
+	if !redo {
+		_ = e.st.setSegmentStatus(ctx, g.ID, SegVoicing)
+	}
 	dir := filepath.Join(e.opt.dataDir, "audio", c.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	wav := filepath.Join(dir, g.ID+".wav")
-	m4a := filepath.Join(dir, g.ID+".m4a")
+	// A new file name each time, so a browser never plays a stale copy.
+	name := g.ID + "-" + newID()[:6]
+	wav := filepath.Join(dir, name+".wav")
+	m4a := filepath.Join(dir, name+".m4a")
+
 	display, speech := paragraphs(g.Script), paragraphs(e.speechFor(ctx, c, g))
 	if len(speech) != len(display) {
 		speech = display
 	}
 	r, err := e.opt.speaker.Render(ctx, c.VoiceID, display, speech, wav)
 	if err != nil {
-		_ = e.st.setSegmentStatus(context.WithoutCancel(ctx), g.ID, SegScripted)
+		if !redo {
+			_ = e.st.setSegmentStatus(context.WithoutCancel(ctx), g.ID, SegScripted)
+		}
 		return err
 	}
 	defer os.Remove(wav)
 	if r.AlignScore < 0.6 && j.Attempts < 2 {
-		_ = e.st.setSegmentStatus(ctx, g.ID, SegScripted)
+		if !redo {
+			_ = e.st.setSegmentStatus(ctx, g.ID, SegScripted)
+		}
 		return fmt.Errorf("voice drifted from the script (alignment %.2f); re-voicing", r.AlignScore)
 	}
 	if out, err := exec.CommandContext(ctx, e.opt.ffmpeg, "-y", "-loglevel", "error", "-i", wav,
 		"-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ac", "1", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", m4a).CombinedOutput(); err != nil {
-		_ = e.st.setSegmentStatus(context.WithoutCancel(ctx), g.ID, SegScripted)
+		if !redo {
+			_ = e.st.setSegmentStatus(context.WithoutCancel(ctx), g.ID, SegScripted)
+		}
 		return fmt.Errorf("ffmpeg: %v: %s", err, out)
 	}
 	words, _ := json.Marshal(r.Words)
@@ -727,7 +741,14 @@ func (e *Engine) doVoice(ctx context.Context, j *Job) error {
 		os.Remove(m4a)
 		return nil
 	}
-	return e.st.updateSegment(ctx, g)
+	if err := e.st.updateSegment(ctx, g); err != nil {
+		return err
+	}
+	if old != "" && old != rel {
+		// Keep the old file a few minutes for a player mid-way through it; pruneOldAudio sweeps it later.
+		_ = os.Rename(e.audioPath(old), e.audioPath(old)+".old")
+	}
+	return nil
 }
 
 type noteOut struct {
@@ -1316,31 +1337,52 @@ func speakable(say string) string {
 	return strings.ToUpper(string(r[0])) + string(r[1:])
 }
 
-// revoice re-voices unheard segments that use term, except the one the owner is on right now.
+// revoice re-voices unheard segments that use term: the one the owner is on first (the player swaps it
+// in at the same word), then the rest in listening order. They stay playable with the old audio until
+// the new audio is ready. Segments not voiced yet need nothing: they pick the lexicon up when voiced.
 func (e *Engine) revoice(ctx context.Context, owner, term string) int {
 	segs, err := e.st.unheardWith(ctx, owner, term)
 	if err != nil {
 		return 0
 	}
-	n := 0
+	current := map[string]string{} // course -> segment being listened to
 	for _, g := range segs {
-		c, err := e.st.course(ctx, g.CourseID)
-		if err != nil {
+		if _, ok := current[g.CourseID]; !ok {
+			current[g.CourseID] = ""
+			if pb, err := e.st.playback(ctx, owner, g.CourseID); err == nil {
+				current[g.CourseID] = pb.SegmentID
+			}
+		}
+	}
+	n, rank := 0, map[string]int{}
+	for _, g := range segs {
+		prio := 50 - rank[g.CourseID]
+		if g.ID == current[g.CourseID] {
+			prio = 60
+		} else {
+			rank[g.CourseID]++
+		}
+		if prio < 36 {
+			prio = 36
+		}
+		if e.st.voiceQueued(ctx, g.ID) {
 			continue
 		}
-		if pb, err := e.st.playback(ctx, owner, c.ID); err == nil && pb.SegmentID == g.ID {
-			continue
-		}
-		_ = e.st.setSegmentStatus(ctx, g.ID, SegScripted)
-		_ = e.st.enqueue(ctx, g.CourseID, "voice", 35, map[string]string{"segment_id": g.ID})
+		_ = e.st.enqueue(ctx, g.CourseID, "voice", prio, map[string]any{"segment_id": g.ID, "redo": true})
 		n++
 	}
 	e.poke()
 	return n
 }
 
-// pruneClips removes pronunciation trial clips older than a day.
+// pruneClips removes pronunciation trial clips older than a day, and audio replaced by a re-voice.
 func (e *Engine) pruneClips() {
+	olds, _ := filepath.Glob(filepath.Join(e.opt.dataDir, "audio", "*", "*.old"))
+	for _, f := range olds {
+		if info, err := os.Stat(f); err == nil && time.Since(info.ModTime()) > time.Hour {
+			_ = os.Remove(f)
+		}
+	}
 	dir := filepath.Join(e.opt.dataDir, "pron")
 	ents, _ := os.ReadDir(dir)
 	for _, d := range ents {

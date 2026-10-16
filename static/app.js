@@ -534,7 +534,8 @@
           close(); toast("“" + word + "” is back to the voice's own way of saying it."); return;
         }
         const r = await api("lexicon", { method: "PUT", body: { term: word, say } });
-        close(); toast("Saved. “" + word + "” is now always said as “" + say + "”." + (r.revoicing ? " Re-voicing " + r.revoicing + " upcoming segment" + (r.revoicing > 1 ? "s" : "") + "; the one playing now keeps its audio." : ""), null, null, 9000);
+        close(); toast("Saved. “" + word + "” is now always said as “" + say + "”." + (r.revoicing ? " Re-voicing this segment first (about a minute), then the rest; it switches over by itself." : ""), null, null, 9000);
+        if (r.revoicing) player.watchRevoice();
       } catch (e) { toast(e.message); }
     };
     api("lexicon").then((l) => {
@@ -917,7 +918,7 @@
       if (!cur) { renderReader(); renderBar(); return; }
       words = Array.isArray(cur.words) ? cur.words : [];
       lit = -1;
-      audio.src = "api/courses/" + courseId + "/audio/" + cur.id;
+      audio.src = "api/courses/" + courseId + "/audio/" + cur.id + "?v=" + encodeURIComponent(cur.audio_v || "");
       audio.playbackRate = SPEEDS[speedIdx];
       const at = resumeAt; resumeAt = 0;
       audio.onloadedmetadata = () => { if (at > 0 && at < audio.duration - 1) audio.currentTime = at; audio.playbackRate = SPEEDS[speedIdx]; };
@@ -1004,6 +1005,29 @@
         load(play); refreshQueueSoon();
       } catch (e) { toast(e.message); }
     }
+    // When the segment you're on is re-voiced (a pronunciation fix), swap the new audio in at the same word.
+    async function checkFresh() {
+      if (!cur || !courseId) return false;
+      let g;
+      try { g = await api("courses/" + courseId + "/segments/" + cur.id); } catch { return false; }
+      if (g.status !== "ready" || !g.audio_v || g.audio_v === cur.audio_v) return false;
+      const i = wordAt(audio.currentTime), playing = !audio.paused;
+      cur = g; words = Array.isArray(g.words) ? g.words : [];
+      const at = i >= 0 && words[i] ? words[i].s : audio.currentTime;
+      audio.src = "api/courses/" + courseId + "/audio/" + cur.id + "?v=" + encodeURIComponent(cur.audio_v);
+      audio.onloadedmetadata = () => { audio.currentTime = Math.min(at, Math.max(0, audio.duration - 1)); audio.playbackRate = SPEEDS[speedIdx]; if (playing) audio.play().catch(() => {}); };
+      renderReader();
+      toast("Now playing with your pronunciation fix.", null, null, 4000);
+      return true;
+    }
+    let freshPoll = null;
+    function watchRevoice() {
+      clearInterval(freshPoll);
+      const until = Date.now() + 6 * 60000;
+      freshPoll = setInterval(async () => { if (Date.now() > until || (await checkFresh())) clearInterval(freshPoll); refreshQueue(); }, 5000);
+    }
+    setInterval(checkFresh, 30000);
+
     function play() {
       if (newer(remote)) return takeOver(remote, true);
       audio.play().catch((e) => toast(e.message));
@@ -1197,7 +1221,7 @@
     $("seek").oninput = () => { seeking = true; };
     $("seek").onchange = () => { if (audio.duration) audio.currentTime = (+$("seek").value / 1000) * audio.duration; seeking = false; };
 
-    return { attach, detach, refreshQueue, jumpTo, setMode, currentId: () => (cur ? cur.id : ""), currentSeg: () => cur };
+    return { attach, detach, refreshQueue, jumpTo, setMode, watchRevoice, currentId: () => (cur ? cur.id : ""), currentSeg: () => cur };
   })();
 
   // ---------- boot ----------
