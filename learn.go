@@ -45,7 +45,21 @@ type options struct {
 	fallback     map[string]string
 	logger       zerolog.Logger
 	title        string
+	researchDirs []string
 }
+
+// ResearchTools is what a research-enabled turn may use: reading and searching files, git history,
+// and GitHub lookups through gh. Nothing that writes, deletes, or reaches the open web.
+var ResearchTools = []string{
+	"Read", "Grep", "Glob",
+	"Bash(ls:*)", "Bash(wc:*)",
+	"Bash(git log:*)", "Bash(git show:*)", "Bash(git diff:*)", "Bash(git grep:*)", "Bash(git blame:*)", "Bash(git ls-files:*)",
+	"Bash(gh repo view:*)", "Bash(gh repo list:*)", "Bash(gh pr view:*)", "Bash(gh pr list:*)", "Bash(gh pr diff:*)",
+	"Bash(gh issue view:*)", "Bash(gh issue list:*)", "Bash(gh search:*)", "Bash(gh release view:*)", "Bash(gh release list:*)",
+}
+
+// WithResearch lets courses that opt in read these folders and GitHub, read-only (see ResearchTools).
+func WithResearch(dirs []string) Option { return func(o *options) { o.researchDirs = dirs } }
 
 // Option configures an Engine.
 type Option func(*options)
@@ -251,7 +265,8 @@ func (e *Engine) topUp(ctx context.Context) {
 			continue // idle for a week: don't spend the subscription
 		}
 		ready, pending := e.st.secondsAhead(ctx, c.ID, ord)
-		if ready+pending >= e.opt.bufferAhead.Seconds() || e.st.hasJob(ctx, c.ID, "script", "extend", "plan") {
+		// Don't let scripts run far ahead of the voice: queued text is wasted if the learner steers.
+		if pending >= 3*180 || ready+pending >= e.opt.bufferAhead.Seconds() || e.st.hasJob(ctx, c.ID, "script", "extend", "plan") {
 			continue
 		}
 		if err := e.st.enqueue(ctx, c.ID, "script", 30, nil); err == nil {
@@ -266,10 +281,14 @@ func (e *Engine) topUp(ctx context.Context) {
 // the fallback provider with a fresh session. It returns the result and whether the session is new.
 func (e *Engine) turn(ctx context.Context, c *Course, name, sessionProv, session string, prompt func(resumed bool) string, out any) (agent.Result, error) {
 	dir := filepath.Join(e.opt.dataDir, "scratch", c.ID)
+	research := c.Research && len(e.opt.researchDirs) > 0 && !strings.HasSuffix(name, "-calibrate")
 	try := func(provider, model, resume string) (agent.Result, error) {
-		res, err := e.opt.runner.Run(ctx, agent.Turn{
-			Provider: provider, Model: model, Dir: dir, Prompt: prompt(resume != ""), Resume: resume, Name: name,
-		})
+		t := agent.Turn{Provider: provider, Model: model, Dir: dir, Prompt: prompt(resume != ""), Resume: resume, Name: name}
+		if research {
+			t.AddDirs, t.AllowTools = e.opt.researchDirs, ResearchTools
+			t.Prompt = researchNote(e.opt.researchDirs) + "\n\n" + t.Prompt
+		}
+		res, err := e.opt.runner.Run(ctx, t)
 		if err != nil {
 			return res, err
 		}

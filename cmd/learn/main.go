@@ -38,6 +38,7 @@ func main() {
 	sidecarDir := flag.String("sidecar", "", "path to go-learn's sidecar/ directory; empty = don't start it")
 	sidecarPort := flag.Int("sidecar-port", 8791, "sidecar port on 127.0.0.1")
 	ahead := flag.Duration("ahead", 45*time.Minute, "voiced audio to keep ready ahead of the listener")
+	research := flag.String("research", "~/elastio,~/projects,~/play", "comma-separated folders the teacher may read (read-only), plus GitHub via gh; '' turns research off")
 	tailnetAddr := flag.String("tailnet-addr", "", "also listen here, on the Mac's Tailscale IP (e.g. 100.x.y.z:8790); callers are identified with tailscale whois")
 	flag.Parse()
 
@@ -69,6 +70,7 @@ func main() {
 		learn.WithVoice(vc, vc),
 		learn.WithBufferAhead(*ahead),
 		learn.WithIdentity(identity(*owner, log)),
+		learn.WithResearch(researchDirs(*research, home)),
 	)
 	if err != nil {
 		log.Fatal().Err(err).Msg("start engine")
@@ -196,4 +198,27 @@ func superviseSidecar(ctx context.Context, log zerolog.Logger, dir string, port 
 			backoff *= 2
 		}
 	}
+}
+
+// researchDirs expands ~ and keeps folders that exist. It never offers the whole home folder: macOS
+// guards Desktop, Documents and the like with privacy prompts no one is there to answer.
+func researchDirs(spec, home string) []string {
+	var out []string
+	for _, d := range strings.Split(spec, ",") {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		if strings.HasPrefix(d, "~/") {
+			d = filepath.Join(home, d[2:])
+		}
+		d = filepath.Clean(d)
+		if d == home || d == "/" {
+			continue
+		}
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			out = append(out, d)
+		}
+	}
+	return out
 }

@@ -136,7 +136,7 @@ func (e *Engine) me(w http.ResponseWriter, r *http.Request) {
 			installed = append(installed, p)
 		}
 	}
-	jsonOK(w, map[string]any{"user": user(r), "title": e.opt.title, "providers": installed})
+	jsonOK(w, map[string]any{"user": user(r), "title": e.opt.title, "providers": installed, "research_dirs": e.opt.researchDirs})
 }
 
 func (e *Engine) voiceList(ctx context.Context) []voice.Voice {
@@ -225,6 +225,7 @@ func (e *Engine) createCourse(w http.ResponseWriter, r *http.Request) {
 		Provider        string `json:"provider"`
 		Model           string `json:"model"`
 		SkipCalibration bool   `json:"skip_calibration"`
+		Research        *bool  `json:"research"`
 	}
 	if err := decode(r, &in); err != nil {
 		jsonErr(w, http.StatusBadRequest, "send JSON: "+err.Error())
@@ -252,7 +253,8 @@ func (e *Engine) createCourse(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	c := &Course{Owner: user(r), Topic: in.Topic, Goal: strings.TrimSpace(in.Goal), Background: strings.TrimSpace(in.Background),
-		VoiceID: in.VoiceID, Provider: in.Provider, Model: strings.TrimSpace(in.Model), Status: StatusCalibrating}
+		VoiceID: in.VoiceID, Provider: in.Provider, Model: strings.TrimSpace(in.Model), Status: StatusCalibrating,
+		Research: in.Research == nil || *in.Research}
 	kind := "calibrate"
 	if in.SkipCalibration {
 		c.Status, kind = StatusPlanning, "plan"
@@ -317,10 +319,12 @@ func (e *Engine) patchCourse(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if raw, ok := in["paused"]; ok {
-		var b bool
-		if json.Unmarshal(raw, &b) == nil {
-			set["paused"] = b2i(b)
+	for _, k := range []string{"paused", "research"} {
+		if raw, ok := in[k]; ok {
+			var b bool
+			if json.Unmarshal(raw, &b) == nil {
+				set[k] = b2i(b)
+			}
 		}
 	}
 	if len(set) == 0 {

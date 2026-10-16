@@ -33,6 +33,10 @@ type Turn struct {
 	Prompt   string
 	Resume   string // provider session to continue, if any
 	Name     string // claude --name on a first turn
+	// Read-only research: extra folders the turn may read, and the tool patterns it may use
+	// (claude --allowedTools syntax, e.g. "Read", "Bash(git log:*)"). Empty means no tools at all.
+	AddDirs    []string
+	AllowTools []string
 }
 
 // Result is one finished turn.
@@ -79,7 +83,7 @@ func (c CLI) Run(ctx context.Context, t Turn) (Result, error) {
 	}
 	timeout := c.Timeout
 	if timeout == 0 {
-		timeout = 6 * time.Minute
+		timeout = 10 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -112,7 +116,27 @@ func (c CLI) Run(ctx context.Context, t Turn) (Result, error) {
 // claude -p --output-format stream-json --verbose, no tools and no MCP servers; the user's own
 // settings (global CLAUDE.md) still load, so the teacher knows the owner.
 func runClaude(ctx context.Context, t Turn) (Result, error) {
-	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--tools", "", "--strict-mcp-config"}
+	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"}
+	if len(t.AllowTools) == 0 {
+		args = append(args, "--tools", "")
+	} else {
+		// Only the tools named in the allowlist exist; anything not allowed is denied (print mode never prompts).
+		seen, names := map[string]bool{}, []string{}
+		for _, p := range t.AllowTools {
+			name := p
+			if i := strings.Index(p, "("); i > 0 {
+				name = p[:i]
+			}
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+		args = append(args, "--tools", strings.Join(names, ","), "--allowedTools", strings.Join(t.AllowTools, ","))
+		for _, d := range t.AddDirs {
+			args = append(args, "--add-dir", d)
+		}
+	}
 	if t.Resume != "" {
 		args = append(args, "--resume", t.Resume)
 	} else if t.Name != "" {

@@ -145,6 +145,7 @@ var alters = []string{
 	`ALTER TABLE learn_nodes ADD COLUMN last_covered_at TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE learn_playback ADD COLUMN device TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE learn_interactions ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE learn_courses ADD COLUMN research INTEGER NOT NULL DEFAULT 1`,
 }
 
 // Course statuses.
@@ -186,6 +187,7 @@ type Course struct {
 	SessionProv string          `json:"-"`
 	SessionN    int             `json:"-"`
 	Steer       string          `json:"steer"`
+	Research    bool            `json:"research"` // the teacher may read local code and GitHub (read-only)
 }
 
 type Calibration struct {
@@ -306,14 +308,14 @@ func (s *store) migrate(ctx context.Context) error {
 
 // ---- courses ----
 
-const courseCols = `id, owner, title, topic, goal, background, voice_id, provider, model, status, calibration, profile, error, paused, created_at, updated_at, session_id, session_provider, session_turns, steer`
+const courseCols = `id, owner, title, topic, goal, background, voice_id, provider, model, status, calibration, profile, error, paused, created_at, updated_at, session_id, session_provider, session_turns, steer, research`
 
 func scanCourse(row interface{ Scan(...any) error }) (*Course, error) {
 	var c Course
 	var cal, prof string
-	var paused int
+	var paused, research int
 	if err := row.Scan(&c.ID, &c.Owner, &c.Title, &c.Topic, &c.Goal, &c.Background, &c.VoiceID, &c.Provider, &c.Model,
-		&c.Status, &cal, &prof, &c.Error, &paused, &c.CreatedAt, &c.UpdatedAt, &c.SessionID, &c.SessionProv, &c.SessionN, &c.Steer); err != nil {
+		&c.Status, &cal, &prof, &c.Error, &paused, &c.CreatedAt, &c.UpdatedAt, &c.SessionID, &c.SessionProv, &c.SessionN, &c.Steer, &research); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errNotFound
 		}
@@ -325,14 +327,15 @@ func scanCourse(row interface{ Scan(...any) error }) (*Course, error) {
 	}
 	c.Profile = json.RawMessage(prof)
 	c.Paused = paused != 0
+	c.Research = research != 0
 	return &c, nil
 }
 
 func (s *store) createCourse(ctx context.Context, c *Course) error {
 	c.ID, c.CreatedAt, c.UpdatedAt = newID(), now(), now()
 	cal, _ := json.Marshal(c.Calibration)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_courses (`+courseCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.Owner, c.Title, c.Topic, c.Goal, c.Background, c.VoiceID, c.Provider, c.Model, c.Status, string(cal), "{}", "", 0, c.CreatedAt, c.UpdatedAt, "", "", 0, "")
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_courses (`+courseCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.Owner, c.Title, c.Topic, c.Goal, c.Background, c.VoiceID, c.Provider, c.Model, c.Status, string(cal), "{}", "", 0, c.CreatedAt, c.UpdatedAt, "", "", 0, "", b2i(c.Research))
 	return err
 }
 
@@ -380,7 +383,7 @@ func (s *store) updateCourse(ctx context.Context, id string, set map[string]any)
 	cols, args := []string{}, []any{}
 	for k, v := range set {
 		switch k {
-		case "title", "status", "error", "voice_id", "provider", "model", "paused", "session_id", "session_provider", "session_turns", "steer":
+		case "title", "status", "error", "voice_id", "provider", "model", "paused", "session_id", "session_provider", "session_turns", "steer", "research":
 		case "calibration", "profile":
 			if b, ok := v.([]byte); ok {
 				v = string(b)

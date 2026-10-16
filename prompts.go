@@ -22,6 +22,17 @@ How to write for the ear:
 - Pitch everything at the learner's current level: don't re-explain what they know; slow down where they're weak.
 - Never invent facts. If something is contested or version-specific, say so.`
 
+// researchNote tells a research-enabled turn what it may look at.
+func researchNote(dirs []string) string {
+	return `You can look things up before you answer, read-only:
+- The learner's local code, in: ` + strings.Join(dirs, ", ") + ` (Read, Grep, Glob, and git log, show, diff, grep, blame).
+- GitHub, through the gh CLI as the learner (gh repo, pr, issue, release view and list, gh pr diff, gh search).
+When the topic, a question or the learner's work involves specific code, products, repos, PRs or issues, look
+them up first and teach from what is actually there, naming files, functions and repos in words. Keep lookups
+focused: a few searches and reads, then teach. Never read code aloud symbol by symbol. Your final message must
+still be only the JSON object asked for.`
+}
+
 func profileBlock(c *Course) string {
 	p := strings.TrimSpace(string(c.Profile))
 	if p == "" || p == "{}" {

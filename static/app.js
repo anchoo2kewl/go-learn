@@ -150,6 +150,8 @@
         h("textarea", { id: "f-bg", placeholder: "Be honest; it sets where we start. A short check comes next either way." })),
       h("div", { class: "field" }, h("span", { style: "font-weight:500" }, "Voice"), voicePicker("", "f-voice")),
       providerFields("claude", ""),
+      (me && me.research_dirs && me.research_dirs.length) ? h("label", { class: "row small" }, h("input", { type: "checkbox", id: "f-research", checked: true }),
+        "Let the teacher read my code (" + me.research_dirs.map((d) => d.replace(/^\/Users\/[^/]+/, "~")).join(", ") + ") and GitHub, read-only") : null,
       h("label", { class: "row small" }, h("input", { type: "checkbox", id: "f-skip" }), "Skip the level check and start right away"),
       err,
       h("div", { class: "row" }, h("button", { class: "primary", type: "submit" }, "Start learning"), h("button", { type: "button", class: "quiet", onclick: () => form.remove() }, "Cancel")));
@@ -162,7 +164,7 @@
         const c = await api("courses", { method: "POST", body: {
           topic: $("f-topic").value, goal: $("f-goal").value, background: $("f-bg").value,
           voice_id: voice ? voice.value : "", provider: $("f-provider").value, model: $("f-model").value,
-          skip_calibration: $("f-skip").checked,
+          skip_calibration: $("f-skip").checked, research: $("f-research") ? $("f-research").checked : false,
         } });
         location.hash = "#/c/" + c.id;
       } catch (e) { err.textContent = e.message; btn.disabled = false; }
@@ -267,6 +269,8 @@
       if (c.error && c.status === "active") els.meta.append(h("div", { style: "color:var(--warn)" }, c.error));
     }
     if (view.tab === "map") drawMindMap();
+    // Nothing playing yet (a new course, or everything heard so far): keep looking for the next segment.
+    if (c.status === "active" && !player.currentSeg()) player.refreshQueue();
   }
 
   function voiceLabel(id) { const v = voices.find((x) => x.id === id); return v ? v.label : id; }
@@ -641,7 +645,9 @@
           await api("courses/" + c.id, { method: "PATCH", body: { voice_id: v ? v.value : c.voice_id, provider: $("f-provider").value, model: $("f-model").value } });
           toast("Saved."); refreshCourse(true);
         } }, "Save"),
-        h("button", { onclick: async () => { await api("courses/" + c.id, { method: "PATCH", body: { paused: !c.paused } }); refreshCourse(true); } }, c.paused ? "Resume generating" : "Pause generating")),
+        h("button", { onclick: async () => { await api("courses/" + c.id, { method: "PATCH", body: { paused: !c.paused } }); refreshCourse(true); } }, c.paused ? "Resume generating" : "Pause generating"),
+        h("button", { onclick: async () => { await api("courses/" + c.id, { method: "PATCH", body: { research: !c.research } }); toast(c.research ? "The teacher won't read your code or GitHub for this topic." : "The teacher can now read your code and GitHub (read-only)."); refreshCourse(true); } },
+          c.research ? "Stop reading my code" : "Let it read my code")),
       h("div", { class: "field" }, h("span", { style: "font-weight:500" }, "Share (listen only)"), members,
         h("div", { class: "row", style: "flex-wrap:nowrap" }, memberInput, h("button", { onclick: async () => {
           if (!memberInput.value.trim()) return;
