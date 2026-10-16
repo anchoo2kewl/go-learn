@@ -188,3 +188,5 @@ label.field > span { font-weight: 500; }
   display: grid; gap: 12px; max-height: 85vh; overflow: auto; }
 @media (min-width: 700px) { .sheet-overlay { align-items: center; } .sheetbox { border-radius: 16px; } }
 .pron-opt { flex-wrap: nowrap; border: 1px solid var(--line); border-radius: 12px; padding: 6px 8px; }
+
+kbd { font-family: var(--font-ui); font-size: 0.8rem; padding: 2px 7px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; background: var(--paper); white-space: nowrap; }

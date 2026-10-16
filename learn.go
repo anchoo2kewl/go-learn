@@ -1264,12 +1264,11 @@ func (e *Engine) doGrade(ctx context.Context, j *Job) error {
 	return e.st.updateQuiz(ctx, q)
 }
 
-// speechFor: the text to voice — the owner's lexicon first (it always wins), then the teacher's hints.
+// speechFor: the text to voice — the teacher's hints, then the owner's lexicon, which always wins.
 func (e *Engine) speechFor(ctx context.Context, c *Course, g *Segment) string {
 	lex, _ := e.st.lexicon(ctx, c.Owner)
 	var pron map[string]string
 	if len(g.Pron) > 2 && json.Unmarshal(g.Pron, &pron) == nil {
-		text := applyLexicon(g.Script, lex)
 		for _, l := range lex {
 			for k := range pron {
 				if strings.EqualFold(k, l.Term) {
@@ -1277,7 +1276,8 @@ func (e *Engine) speechFor(ctx context.Context, c *Course, g *Segment) string {
 				}
 			}
 		}
-		return applyPronunciations(text, pron)
+		// Lexicon last: a hint like "elastio-stack" -> "elastio stack" must not bring the old word back.
+		return applyLexicon(applyPronunciations(g.Script, pron), lex)
 	}
 	return applyLexicon(g.Speech, lex)
 }

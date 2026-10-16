@@ -11,6 +11,8 @@ memory back.
   POST /render     {voice_id, display[], speech[], out}   -> {duration_s, words[], align_score}
   POST /transcribe {path}                          -> {text}
   POST /preview    {voice_id, out}                 a short sample of the voice
+  POST /pronounce  {voice_id, recording, candidates[], outdir, carrier?}  -> {options[]} ranked
+  POST /say        {voice_id, text, out}
 
 `display` is the script as shown (paragraphs); `speech` is the same paragraphs as they should be said
 (pronunciation fixes applied). Speech is rendered paragraph by paragraph with the voice's fixed reference
@@ -236,15 +238,18 @@ def pronounce(req):
     if rec.ndim > 1:
         rec = rec.mean(axis=1)
     target = _features(rec, rsr)
+    carrier = req.get("carrier") or ""
     out = []
     for i, say in enumerate(req["candidates"]):
         say = str(say).strip()
         if not say:
             continue
-        audio, sr = synth(voice, say)
+        audio, sr = synth(voice, say)  # the word alone, to compare with the recording
+        dist = _distance(target, _features(audio, sr)) if target.shape[1] > 5 else 0.0
+        if "{w}" in carrier:  # what you hear: the word in its sentence, the way segments say it
+            audio, sr = synth(voice, carrier.replace("{w}", say))
         path = str(Path(req["outdir"]) / f"{i}.wav")
         sf.write(path, audio, sr)
-        dist = _distance(target, _features(audio, sr)) if target.shape[1] > 5 else 0.0
         out.append({"say": say, "path": path, "distance": round(dist, 4)})
     out.sort(key=lambda x: x["distance"])
     return {"options": out}

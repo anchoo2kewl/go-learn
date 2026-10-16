@@ -477,9 +477,10 @@
   }
 
   // ---------- teach a pronunciation ----------
-  function teachWord(raw) {
+  function teachWord(raw, sentence = "") {
     const word = raw.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/['’]s$/, "");
     if (!word) return;
+    const same = (say) => say.trim().toLowerCase() === word.toLowerCase();
     const results = h("div", { class: "stack" });
     const status = h("p", { class: "muted small", style: "margin:0" }, "Tap Record, say the word the way it should sound, then Stop.");
     let rec = null, chunks = [];
@@ -489,14 +490,19 @@
     let close = () => {};
     const use = async (say) => {
       try {
+        if (same(say)) {
+          await api("lexicon/" + encodeURIComponent(word), { method: "DELETE" });
+          close(); toast("Kept “" + word + "” as written. Nothing to re-voice."); return;
+        }
         const r = await api("lexicon", { method: "PUT", body: { term: word, say } });
         close(); toast("Saved: “" + word + "” will be said as “" + say + "”." + (r.revoicing ? " Re-voicing " + r.revoicing + " upcoming segment" + (r.revoicing > 1 ? "s" : "") + "." : ""));
       } catch (e) { toast(e.message); }
     };
     const option = (o, best) => h("div", { class: "row pron-opt" },
       h("button", { onclick: () => play(o.url), "aria-label": "Play " + o.say }, "▶"),
-      h("span", { style: "flex:1;min-width:0" }, o.say, best ? h("span", { class: "pill live", style: "margin-left:8px" }, "closest to you") : null),
-      h("button", { class: "small", onclick: () => use(o.say) }, "Use this"));
+      h("span", { style: "flex:1;min-width:0" }, o.say, same(o.say) ? h("span", { class: "muted small", style: "margin-left:8px" }, "as it says it now") : null,
+        best ? h("span", { class: "pill live", style: "margin-left:8px" }, "closest to you") : null),
+      h("button", { class: "small", onclick: () => use(o.say) }, same(o.say) ? "Keep as is" : "Use this"));
     recBtn.onclick = async () => {
       if (rec && rec.state === "recording") { rec.stop(); return; }
       if (!navigator.mediaDevices || !window.MediaRecorder) { status.textContent = "Recording needs the HTTPS address. You can still type how it sounds below."; return; }
@@ -507,14 +513,15 @@
         rec.onstop = async () => {
           stream.getTracks().forEach((t) => t.stop());
           recBtn.textContent = "Record again"; recBtn.classList.remove("rec");
-          status.replaceChildren(h("span", { class: "spinner" }), " Trying spellings in your teacher's voice and matching them to yours (about 20 seconds)…");
+          status.replaceChildren(h("span", { class: "spinner" }), " Trying spellings in your teacher's voice and matching them to yours (about 30 seconds)…");
           results.replaceChildren();
           const fd = new FormData();
           fd.append("word", word);
+          fd.append("context", sentence);
           fd.append("audio", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "word");
           try {
             const r = await api("courses/" + view.id + "/pronounce", { method: "POST", body: fd });
-            status.textContent = "Heard: “" + (r.heard || "?") + "”. Listen and pick the one that sounds right.";
+            status.textContent = "Heard: “" + (r.heard || "?") + "”. Each option says the word in its sentence. Pick the one that sounds right.";
             results.replaceChildren(...r.options.map((o, i) => option(o, i === 0)));
             if (r.options[0]) play(r.options[0].url);
           } catch (e) { status.textContent = "That didn't work: " + e.message; }
@@ -526,7 +533,7 @@
     tryBtn.onclick = async () => {
       if (!typed.value.trim()) return;
       tryBtn.disabled = true;
-      try { const r = await api("courses/" + view.id + "/pronounce/try", { method: "POST", body: { say: typed.value } }); results.prepend(option({ say: typed.value.trim(), url: r.url }, false)); play(r.url); }
+      try { const r = await api("courses/" + view.id + "/pronounce/try", { method: "POST", body: { say: typed.value, word, context: sentence } }); results.prepend(option({ say: typed.value.trim(), url: r.url }, false)); play(r.url); }
       catch (e) { toast(e.message); }
       tryBtn.disabled = false;
     };
@@ -1065,7 +1072,7 @@
       if (i == null || !words[+i]) return;
       if (view && view.els && view.els.reader && view.els.reader.classList.contains("fixing")) {
         view.els.fix.click();
-        teachWord(words[+i].w);
+        teachWord(words[+i].w, sentenceAt(+i));
         return;
       }
       audio.currentTime = words[+i].s + 0.01; userScrolled = false; $("back").hidden = true;
@@ -1083,7 +1090,51 @@
     audio.addEventListener("error", () => { if (cur) toast("Couldn't play this segment; skipping it.", null, null, 4000); setTimeout(() => advance(true), 1500); });
     document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") save(); });
 
+    // The sentence a word sits in, so a pronunciation can be tried the way the segment says it.
+    function sentenceAt(i) {
+      const end = (w) => /[.!?]["'”’)]*$/.test(w.w);
+      let a = i, b = i;
+      while (a > 0 && words[a - 1].p === words[i].p && !end(words[a - 1])) a--;
+      while (b < words.length - 1 && words[b + 1].p === words[i].p && !end(words[b])) b++;
+      return words.slice(a, b + 1).map((w) => w.w).join(" ");
+    }
+
     $("play").onclick = () => { if (!cur) return; audio.paused ? play() : audio.pause(); };
+
+    // Keyboard: space or k play/pause, arrows or j/l skip 15s, up/down volume, n next, [ ] speed,
+    // m mute, a ask, ? the list.
+    const setSpeed = (i) => { speedIdx = i; audio.playbackRate = SPEEDS[i]; store.set("speed", SPEEDS[i]); $("speed").textContent = SPEEDS[i] + "×"; toast("Speed " + SPEEDS[i] + "×", null, null, 1200); };
+    const ordered = SPEEDS.map((v, i) => [v, i]).sort((x, y) => x[0] - y[0]);
+    const stepSpeed = (d) => { const k = ordered.findIndex(([, i]) => i === speedIdx); const n = ordered[Math.max(0, Math.min(ordered.length - 1, k + d))]; setSpeed(n[1]); };
+    const setVol = (v) => { audio.muted = false; audio.volume = Math.max(0, Math.min(1, Math.round(v * 10) / 10)); store.set("volume", audio.volume); toast("Volume " + Math.round(audio.volume * 100) + "%", null, null, 1200); };
+    { const v = store.get("volume", null); if (typeof v === "number" && v >= 0 && v <= 1) audio.volume = v; }
+    document.addEventListener("keydown", (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.defaultPrevented) return;
+      const t = e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (document.querySelector(".sheet-overlay")) { if (e.key === "Escape") document.querySelectorAll(".sheet-overlay").forEach((x) => x.remove()); return; }
+      const k = e.key;
+      const act = {
+        " ": () => $("play").click(), k: () => $("play").click(),
+        ArrowLeft: () => $("rew").click(), j: () => $("rew").click(),
+        ArrowRight: () => (e.shiftKey ? $("next").click() : $("fwd").click()), l: () => $("fwd").click(),
+        ArrowUp: () => setVol(audio.volume + 0.1), ArrowDown: () => setVol(audio.volume - 0.1),
+        n: () => $("next").click(), N: () => $("next").click(),
+        "]": () => stepSpeed(1), "[": () => stepSpeed(-1),
+        m: () => { audio.muted = !audio.muted; toast(audio.muted ? "Muted" : "Sound on", null, null, 1200); },
+        a: () => openAsk(), "?": () => showKeys(),
+      }[k];
+      if (!act || !cur && !"a?".includes(k)) return;
+      if (t && t.tagName === "BUTTON" && (k === " " || k === "Enter")) return; // let a focused button do its own thing
+      e.preventDefault(); act();
+    });
+    function showKeys() {
+      const row = (key, what) => h("div", { class: "spread", style: "padding:4px 0;border-bottom:1px solid var(--line)" }, h("span", {}, what), h("kbd", {}, key));
+      openSheet("Keyboard shortcuts",
+        row("Space or K", "Play / pause"), row("← or J", "Back 15 seconds"), row("→ or L", "Forward 15 seconds"),
+        row("Shift → or N", "Next segment"), row("↑ / ↓", "Volume up / down"), row("M", "Mute"),
+        row("[ / ]", "Slower / faster"), row("A", "Ask or steer"), row("Esc", "Close a panel"), row("?", "This list"));
+    }
     $("rew").onclick = () => { audio.currentTime = Math.max(0, audio.currentTime - 15); };
     $("fwd").onclick = () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 15); };
     $("next").onclick = () => advance(!audio.paused);
