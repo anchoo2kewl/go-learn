@@ -1289,9 +1289,31 @@ func applyLexicon(text string, lex []LexEntry) string {
 		if err != nil || strings.TrimSpace(l.Say) == "" {
 			continue
 		}
-		text = re.ReplaceAllString(text, "${1}"+strings.ReplaceAll(l.Say, "$", "$$")+"${2}")
+		text = re.ReplaceAllString(text, "${1}"+strings.ReplaceAll(speakable(l.Say), "$", "$$")+"${2}")
 	}
 	return text
+}
+
+var syllables = regexp.MustCompile(`^\pL+(-\pL+)+$`)
+
+// speakable turns a dictionary-style respelling ("ee-LAS-tee-oh") into one word ("Eelasteeoh"). The voice
+// pauses at hyphens and reads capitals as letters, so a syllable spelling comes out as "ee, L-A-S, tee, oh".
+func speakable(say string) string {
+	say = strings.TrimSpace(say)
+	if !syllables.MatchString(say) {
+		return say
+	}
+	lower, caps := false, false // a stress-marked spelling mixes lowercase and capitalised syllables
+	for _, p := range strings.Split(say, "-") {
+		lower = lower || p == strings.ToLower(p)
+		caps = caps || (len([]rune(p)) > 1 && p == strings.ToUpper(p))
+	}
+	if !lower || !caps {
+		return say
+	}
+	w := strings.ToLower(strings.ReplaceAll(say, "-", ""))
+	r := []rune(w)
+	return strings.ToUpper(string(r[0])) + string(r[1:])
 }
 
 // revoice re-voices unheard segments that use term, except the one the owner is on right now.

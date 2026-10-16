@@ -378,9 +378,9 @@ func pronouncePrompt(word, heard string) string {
 They recorded themselves saying it; a speech recogniser heard: "` + heard + `".
 
 Give 6 different respellings that an English text-to-speech voice would read aloud to produce the
-learner's pronunciation. Vary the stress and the vowel sounds. Write them as plain respellings with
-hyphenated syllables and the stressed syllable in capitals (for example "ee-LAS-tee-oh"), and include the
-word as written if it could plausibly be right.
+learner's pronunciation. Vary the stress and the vowel sounds. Each must be ONE word that looks like an
+ordinary English word, capitalised like a name, with no hyphens, spaces or capitals inside (for example
+"Ehlastyo", "Elasteeo", "Eelastio"): the voice pauses at hyphens and spells out capitals letter by letter.
 
 Reply with only a JSON object, no prose and no code fences:
 {"candidates": ["...", "...", "...", "...", "...", "..."]}`

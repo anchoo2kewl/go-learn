@@ -889,7 +889,7 @@ func (e *Engine) pronounce(w http.ResponseWriter, r *http.Request) {
 	if len(cands) > 7 {
 		cands = cands[:7]
 	}
-	opts, err := e.opt.speaker.Pronounce(ctx, c.VoiceID, wav, cands, carrierFor(word, r.FormValue("context")), dir)
+	opts, err := e.opt.speaker.Pronounce(ctx, c.VoiceID, wav, cands, "", dir)
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -906,9 +906,7 @@ func (e *Engine) pronounce(w http.ResponseWriter, r *http.Request) {
 func (e *Engine) pronounceTry(w http.ResponseWriter, r *http.Request) {
 	c := courseOf(r)
 	var in struct {
-		Say     string `json:"say"`
-		Word    string `json:"word"`
-		Context string `json:"context"`
+		Say string `json:"say"`
 	}
 	if err := decode(r, &in); err != nil || strings.TrimSpace(in.Say) == "" || len(in.Say) > 80 {
 		jsonErr(w, http.StatusBadRequest, "type how it should sound")
@@ -918,36 +916,12 @@ func (e *Engine) pronounceTry(w http.ResponseWriter, r *http.Request) {
 	dir := filepath.Join(e.opt.dataDir, "pron", token)
 	_ = os.MkdirAll(dir, 0o755)
 	name := "try-" + newID() + ".wav"
-	text := strings.TrimSpace(in.Say)
-	if carrier := carrierFor(in.Word, in.Context); carrier != "" {
-		text = strings.ReplaceAll(carrier, "{w}", text)
-	}
-	if err := e.opt.speaker.Say(r.Context(), c.VoiceID, text, filepath.Join(dir, name)); err != nil {
+	// Voiced exactly as a segment would say it.
+	if err := e.opt.speaker.Say(r.Context(), c.VoiceID, speakable(in.Say), filepath.Join(dir, name)); err != nil {
 		jsonErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	jsonOK(w, map[string]string{"url": "api/courses/" + c.ID + "/pronounce/clip/" + token + "/" + name})
-}
-
-// carrierFor turns the sentence the word was tapped in into a template with "{w}" in the word's place,
-// so trial clips say the word the way a segment would. A word can sound right alone and wrong mid-sentence.
-func carrierFor(word, sentence string) string {
-	if word == "" {
-		return ""
-	}
-	sentence = strings.Join(strings.Fields(sentence), " ")
-	if len(sentence) > 240 {
-		sentence = ""
-	}
-	if sentence != "" {
-		re, err := regexp.Compile(`(?i)(^|[^\pL\pN])` + regexp.QuoteMeta(word) + `($|[^\pL\pN])`)
-		if err == nil {
-			if loc := re.FindStringSubmatchIndex(sentence); loc != nil {
-				return sentence[:loc[3]] + "{w}" + sentence[loc[4]:]
-			}
-		}
-	}
-	return "Today we'll look at {w}, and how it works."
 }
 
 func (e *Engine) pronounceClip(w http.ResponseWriter, r *http.Request) {

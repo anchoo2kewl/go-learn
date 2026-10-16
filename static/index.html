@@ -21,16 +21,19 @@
 <div class="bar" id="bar" hidden>
   <div class="bar-inner">
     <div class="bar-now"><b id="bar-title">—</b><span id="bar-sub" class="muted"></span></div>
-    <div class="row">
-      <button id="rew" aria-label="Back 15 seconds" title="Back 15 seconds (←)">−15</button>
-      <button id="play" class="play" aria-label="Play" title="Play / pause (Space) · ? for all shortcuts">Play</button>
-      <button id="fwd" aria-label="Forward 15 seconds" title="Forward 15 seconds (→)">+15</button>
-      <button id="next" aria-label="Next segment" title="Next segment (N)">Next</button>
-      <button id="speed" aria-label="Playback speed" title="Speed ([ and ])">1×</button>
-      <button id="ask" aria-label="Ask or steer" title="Ask or steer (A)">Ask</button>
-      <span class="time" id="time">0:00 / 0:00</span>
-    </div>
     <input type="range" id="seek" min="0" max="1000" value="0" aria-label="Position in this segment">
+    <div class="bar-controls">
+      <div class="bar-side"><button id="speed" aria-label="Playback speed" title="Speed ([ and ])">1×</button><span class="time" id="time">0:00 / 0:00</span></div>
+      <div class="bar-center">
+        <button id="rew" class="icon" aria-label="Back 15 seconds" title="Back 15 seconds (←)"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V2L7 6l5 4V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/><text x="12" y="16.2" font-size="6.6" font-weight="700" text-anchor="middle" font-family="system-ui,sans-serif">15</text></svg></button>
+        <button id="play" class="icon play" aria-label="Play" title="Play / pause (Space) · ? for all shortcuts"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/></svg></button>
+        <button id="fwd" class="icon" aria-label="Forward 15 seconds" title="Forward 15 seconds (→)"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V2l5 4-5 4V7a6 6 0 1 0 6 6h2a8 8 0 1 1-8-8z"/><text x="12" y="16.2" font-size="6.6" font-weight="700" text-anchor="middle" font-family="system-ui,sans-serif">15</text></svg></button>
+        <button id="next" class="icon" aria-label="Next segment" title="Next segment (N)"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5.5v13a1 1 0 0 0 1.5.86L17 13.2V18a1 1 0 0 0 2 0V6a1 1 0 0 0-2 0v4.8L7.5 4.64A1 1 0 0 0 6 5.5z"/></svg></button>
+      </div>
+      <div class="bar-side right">
+        <button id="ask" class="icon" aria-label="Ask or steer" title="Ask or steer (A)"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-4.4 3.5A.6.6 0 0 1 3.6 20V5H4zm4 4.5h8v-1.6H8zm0 3.6h5.5v-1.6H8z"/></svg></button>
+      </div>
+    </div>
   </div>
 </div>
 <button class="back" id="back" hidden>Back to the voice</button>

@@ -308,7 +308,7 @@
   // ---------- voice input ----------
   function micButton(onText) {
     let rec = null, chunks = [];
-    const btn = h("button", { type: "button", class: "mic", "aria-label": "Speak" }, "Speak");
+    const btn = h("button", { type: "button", class: "mic icon", "aria-label": "Speak", title: "Speak" }, icon("mic"));
     if (!navigator.mediaDevices || !window.MediaRecorder) { btn.disabled = true; btn.title = "Voice input needs HTTPS and a browser with a microphone."; return btn; }
     btn.addEventListener("click", async () => {
       if (rec && rec.state === "recording") { rec.stop(); return; }
@@ -319,17 +319,17 @@
         rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
         rec.onstop = async () => {
           stream.getTracks().forEach((t) => t.stop());
-          btn.classList.remove("rec"); btn.textContent = "…"; btn.disabled = true;
+          btn.classList.remove("rec"); btn.replaceChildren(h("span", { class: "spinner" })); btn.disabled = true;
           try {
             const fd = new FormData();
             fd.append("audio", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "speech");
             const r = await api("courses/" + view.id + "/transcribe", { method: "POST", body: fd });
             if (r.text) onText(r.text); else toast("I didn't catch anything. Try again a little closer to the mic.");
           } catch (e) { toast("Couldn't transcribe: " + e.message); }
-          btn.textContent = "Speak"; btn.disabled = false;
+          setIcon(btn, "mic", "Speak"); btn.disabled = false;
         };
         rec.start();
-        btn.classList.add("rec"); btn.textContent = "Stop";
+        btn.classList.add("rec"); setIcon(btn, "stop", "Stop");
       } catch (e) { toast("Microphone unavailable: " + e.message); }
     });
     return btn;
@@ -476,69 +476,104 @@
     setTimeout(() => ta.focus(), 50);
   }
 
+  // ---------- icons ----------
+  const ICONS = {
+    play: '<path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/>',
+    pause: '<rect x="6" y="5" width="4.5" height="14" rx="1.2"/><rect x="13.5" y="5" width="4.5" height="14" rx="1.2"/>',
+    back: '<path d="M12 5V2L7 6l5 4V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/><text x="12" y="16.2" font-size="6.6" font-weight="700" text-anchor="middle" font-family="system-ui,sans-serif">15</text>',
+    fwd: '<path d="M12 5V2l5 4-5 4V7a6 6 0 1 0 6 6h2a8 8 0 1 1-8-8z"/><text x="12" y="16.2" font-size="6.6" font-weight="700" text-anchor="middle" font-family="system-ui,sans-serif">15</text>',
+    next: '<path d="M6 5.5v13a1 1 0 0 0 1.5.86L17 13.2V18a1 1 0 0 0 2 0V6a1 1 0 0 0-2 0v4.8L7.5 4.64A1 1 0 0 0 6 5.5z"/>',
+    ask: '<path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-4.4 3.5A.6.6 0 0 1 3.6 20V5H4zm4 4.5h8v-1.6H8zm0 3.6h5.5v-1.6H8z"/>',
+    mic: '<path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/>',
+    stop: '<rect x="6" y="6" width="12" height="12" rx="2.5"/>',
+    check: '<path d="M9.5 16.2 5.3 12l-1.4 1.4 5.6 5.6L20.1 8.4 18.7 7z"/>',
+    trash: '<path d="M9 3h6l1 2h4v2H4V5h4zm-3 6h12l-1 12H7z"/>',
+    sound: '<path d="M4 9v6h4l5 4V5L8 9zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4zM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6z"/>',
+  };
+  function icon(name, label) {
+    const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    s.setAttribute("viewBox", "0 0 24 24"); s.setAttribute("aria-hidden", "true"); s.setAttribute("class", "ico");
+    s.innerHTML = ICONS[name];
+    return label ? [s, h("span", {}, label)] : s;
+  }
+  const iconButton = (name, label, attrs = {}) => h("button", { class: "icon", "aria-label": label, title: label, ...attrs }, icon(name));
+  function setIcon(btn, name, label) { btn.replaceChildren(icon(name)); btn.setAttribute("aria-label", label); }
+
   // ---------- teach a pronunciation ----------
-  function teachWord(raw, sentence = "") {
-    const word = raw.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/['’]s$/, "");
-    if (!word) return;
+  function teachWord(raw) {
+    const word = raw.trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/['’]s$/, "");
+    if (!word || word.length > 60) return;
     const same = (say) => say.trim().toLowerCase() === word.toLowerCase();
-    const results = h("div", { class: "stack" });
-    const status = h("p", { class: "muted small", style: "margin:0" }, "Tap Record, say the word the way it should sound, then Stop.");
-    let rec = null, chunks = [];
-    const recBtn = h("button", { class: "primary" }, "Record");
-    const typed = h("input", { type: "text", placeholder: "Or type how it sounds, e.g. ee-LAS-tee-oh", autocomplete: "off" });
-    const play = (url) => { const a = new Audio(url); a.play().catch(() => {}); };
+    const input = h("input", { type: "text", value: word, autocomplete: "off", spellcheck: "false", autocapitalize: "off", "aria-label": "How it sounds" });
+    const saved = h("p", { class: "muted small", style: "margin:0" });
+    const tips = h("div", { class: "row" });
+    const status = h("p", { class: "muted small", style: "margin:0" },
+      "Spell it as one word, the way it sounds (for example Ehlastyo or Elasteeo), then press play to hear it. Save when it's right.");
+    const playOnce = (url) => { const a = new Audio(url); a.play().catch(() => {}); };
+    let heard = { say: "", url: "" };
+    const hearBtn = iconButton("play", "Hear it", { class: "icon primary" });
+    const hear = async () => {
+      const say = input.value.trim();
+      if (!say) return;
+      if (heard.say === say) return playOnce(heard.url);
+      hearBtn.disabled = true; hearBtn.replaceChildren(h("span", { class: "spinner" }));
+      try { const r = await api("courses/" + view.id + "/pronounce/try", { method: "POST", body: { say } }); heard = { say, url: r.url }; playOnce(r.url); }
+      catch (e) { toast(e.message); }
+      hearBtn.disabled = false; hearBtn.replaceChildren(icon("play"));
+    };
+    hearBtn.onclick = hear;
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); hear(); } });
     let close = () => {};
-    const use = async (say) => {
+    const saveBtn = h("button", { class: "primary" }, icon("check", "Save"));
+    saveBtn.onclick = async () => {
+      const say = input.value.trim();
+      if (!say) return;
       try {
         if (same(say)) {
           await api("lexicon/" + encodeURIComponent(word), { method: "DELETE" });
-          close(); toast("Kept “" + word + "” as written. Nothing to re-voice."); return;
+          close(); toast("“" + word + "” is back to the voice's own way of saying it."); return;
         }
         const r = await api("lexicon", { method: "PUT", body: { term: word, say } });
-        close(); toast("Saved: “" + word + "” will be said as “" + say + "”." + (r.revoicing ? " Re-voicing " + r.revoicing + " upcoming segment" + (r.revoicing > 1 ? "s" : "") + "." : ""));
+        close(); toast("Saved. “" + word + "” is now always said as “" + say + "”." + (r.revoicing ? " Re-voicing " + r.revoicing + " upcoming segment" + (r.revoicing > 1 ? "s" : "") + "; the one playing now keeps its audio." : ""), null, null, 9000);
       } catch (e) { toast(e.message); }
     };
-    const option = (o, best) => h("div", { class: "row pron-opt" },
-      h("button", { onclick: () => play(o.url), "aria-label": "Play " + o.say }, "▶"),
-      h("span", { style: "flex:1;min-width:0" }, o.say, same(o.say) ? h("span", { class: "muted small", style: "margin-left:8px" }, "as it says it now") : null,
-        best ? h("span", { class: "pill live", style: "margin-left:8px" }, "closest to you") : null),
-      h("button", { class: "small", onclick: () => use(o.say) }, same(o.say) ? "Keep as is" : "Use this"));
+    api("lexicon").then((l) => {
+      const e = l.find((x) => x.term.toLowerCase() === word.toLowerCase());
+      if (e) { input.value = e.say; saved.textContent = "Saved now: “" + e.say + "”. Change it, or set it back to “" + word + "” to undo."; }
+    }).catch(() => {});
+
+    // Optional: say it, and get spellings to try.
+    let rec = null, chunks = [];
+    const recBtn = iconButton("mic", "Say it and get suggestions");
     recBtn.onclick = async () => {
       if (rec && rec.state === "recording") { rec.stop(); return; }
-      if (!navigator.mediaDevices || !window.MediaRecorder) { status.textContent = "Recording needs the HTTPS address. You can still type how it sounds below."; return; }
+      if (!navigator.mediaDevices || !window.MediaRecorder) { status.textContent = "Recording needs the HTTPS address. Typing works anywhere."; return; }
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         chunks = []; rec = new MediaRecorder(stream);
         rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
         rec.onstop = async () => {
           stream.getTracks().forEach((t) => t.stop());
-          recBtn.textContent = "Record again"; recBtn.classList.remove("rec");
-          status.replaceChildren(h("span", { class: "spinner" }), " Trying spellings in your teacher's voice and matching them to yours (about 30 seconds)…");
-          results.replaceChildren();
+          setIcon(recBtn, "mic", "Say it and get suggestions"); recBtn.classList.remove("rec");
+          status.replaceChildren(h("span", { class: "spinner" }), " Finding spellings that sound like you…");
+          tips.replaceChildren();
           const fd = new FormData();
           fd.append("word", word);
-          fd.append("context", sentence);
           fd.append("audio", new Blob(chunks, { type: rec.mimeType || "audio/webm" }), "word");
           try {
             const r = await api("courses/" + view.id + "/pronounce", { method: "POST", body: fd });
-            status.textContent = "Heard: “" + (r.heard || "?") + "”. Each option says the word in its sentence. Pick the one that sounds right.";
-            results.replaceChildren(...r.options.map((o, i) => option(o, i === 0)));
-            if (r.options[0]) play(r.options[0].url);
+            status.textContent = "Closest to you first. Tap one to hear it and put it in the box.";
+            tips.replaceChildren(...r.options.filter((o) => !same(o.say)).map((o) =>
+              h("button", { class: "chip", onclick: () => { input.value = o.say; heard = { say: o.say, url: o.url }; playOnce(o.url); } }, icon("sound"), o.say)));
           } catch (e) { status.textContent = "That didn't work: " + e.message; }
         };
-        rec.start(); recBtn.textContent = "Stop"; recBtn.classList.add("rec"); status.textContent = "Listening… say “" + word + "”.";
+        rec.start(); setIcon(recBtn, "stop", "Stop"); recBtn.classList.add("rec"); status.textContent = "Listening… say “" + word + "”, then press stop.";
       } catch (e) { status.textContent = "Microphone unavailable: " + e.message; }
     };
-    const tryBtn = h("button", {}, "Try");
-    tryBtn.onclick = async () => {
-      if (!typed.value.trim()) return;
-      tryBtn.disabled = true;
-      try { const r = await api("courses/" + view.id + "/pronounce/try", { method: "POST", body: { say: typed.value, word, context: sentence } }); results.prepend(option({ say: typed.value.trim(), url: r.url }, false)); play(r.url); }
-      catch (e) { toast(e.message); }
-      tryBtn.disabled = false;
-    };
-    close = openSheet("How do you say “" + word + "”?", status, h("div", { class: "row" }, recBtn), results,
-      h("div", { class: "row", style: "flex-wrap:nowrap" }, typed, tryBtn));
+    close = openSheet("How should “" + word + "” sound?", saved,
+      h("div", { class: "row", style: "flex-wrap:nowrap" }, input, hearBtn, recBtn), status, tips,
+      h("div", { class: "row" }, saveBtn));
+    setTimeout(() => { input.focus(); input.select(); }, 50);
   }
 
   // ---------- mind map ----------
@@ -782,9 +817,10 @@
       let lex = [];
       try { lex = await api("lexicon"); } catch {}
       lexBox.replaceChildren(h("span", { style: "font-weight:500" }, "Pronunciations (all your topics)"),
-        lex.length ? null : h("span", { class: "muted small" }, "None yet. In the transcript, tap “Fix a word”, then the word, and say it."),
+        lex.length ? null : h("span", { class: "muted small" }, "None yet. Select a word in the transcript (double-click, or press and hold on a phone), then “Fix how it's said”."),
         ...lex.map((l) => h("div", { class: "row small" }, h("b", {}, l.term), "→", h("span", { style: "flex:1" }, l.say),
-          h("button", { class: "quiet small danger", onclick: async () => { await api("lexicon/" + encodeURIComponent(l.term), { method: "DELETE" }); drawLex(); } }, "Remove"))));
+          iconButton("play", "Hear " + l.say, { class: "icon quiet", onclick: async () => { try { const r = await api("courses/" + d.course.id + "/pronounce/try", { method: "POST", body: { say: l.say } }); new Audio(r.url).play().catch(() => {}); } catch (e) { toast(e.message); } } }),
+          iconButton("trash", "Remove " + l.term, { class: "icon quiet danger", onclick: async () => { await api("lexicon/" + encodeURIComponent(l.term), { method: "DELETE" }); drawLex(); } }))));
     };
     drawLex();
     const box = h("details", { class: "panel" }, h("summary", {}, h("b", {}, "Settings")),
@@ -1072,12 +1108,37 @@
       if (i == null || !words[+i]) return;
       if (view && view.els && view.els.reader && view.els.reader.classList.contains("fixing")) {
         view.els.fix.click();
-        teachWord(words[+i].w, sentenceAt(+i));
+        teachWord(words[+i].w);
         return;
       }
-      audio.currentTime = words[+i].s + 0.01; userScrolled = false; $("back").hidden = true;
-      if (audio.paused && mode !== "read") audio.play().catch(() => {});
+      // A double-click selects the word to fix it; wait a moment so it doesn't also jump the audio.
+      if (e.detail > 1) { clearTimeout(seekTimer); return; }
+      clearTimeout(seekTimer);
+      seekTimer = setTimeout(() => {
+        if (String(getSelection() || "").trim()) return;
+        audio.currentTime = words[+i].s + 0.01; userScrolled = false; $("back").hidden = true;
+        if (audio.paused && mode !== "read") audio.play().catch(() => {});
+      }, 280);
     });
+    let seekTimer = null;
+
+    // Select a word (or a short phrase) in the transcript to fix how it's said.
+    const fixPop = h("button", { class: "fixpop", hidden: true }, icon("sound", "Fix how it's said"));
+    document.body.append(fixPop);
+    let selected = "";
+    fixPop.addEventListener("pointerdown", (e) => e.preventDefault()); // keep the selection
+    fixPop.onclick = () => { fixPop.hidden = true; const w = selected; getSelection().removeAllRanges(); teachWord(w); };
+    document.addEventListener("selectionchange", () => {
+      const sel = getSelection(), r = view && view.els && view.els.reader;
+      const text = String(sel || "").trim().replace(/\s+/g, " ");
+      if (!r || !view.data || !view.data.can_steer || !text || text.length > 60 || text.split(" ").length > 4 || !sel.rangeCount || !r.contains(sel.anchorNode)) { fixPop.hidden = true; return; }
+      selected = text;
+      const rc = sel.getRangeAt(0).getBoundingClientRect();
+      fixPop.hidden = false;
+      fixPop.style.left = Math.max(8, Math.min(innerWidth - fixPop.offsetWidth - 8, rc.left + rc.width / 2 - fixPop.offsetWidth / 2)) + "px";
+      fixPop.style.top = Math.max(8, rc.top - fixPop.offsetHeight - 10) + "px";
+    });
+    addEventListener("scroll", () => { fixPop.hidden = true; }, { passive: true });
     const manual = () => { if (!audio.paused && mode === "both") { userScrolled = true; $("back").hidden = false; } };
     addEventListener("wheel", manual, { passive: true });
     addEventListener("touchmove", manual, { passive: true });
@@ -1085,19 +1146,10 @@
 
     audio.addEventListener("ended", () => advance(true));
     audio.addEventListener("timeupdate", () => { if (!audio.paused && Date.now() - lastSave > 10000) save(); });
-    audio.addEventListener("play", () => { $("play").textContent = "Pause"; if (mode === "read") setMode("both"); save(); });
-    audio.addEventListener("pause", () => { $("play").textContent = "Play"; save(); });
+    audio.addEventListener("play", () => { setIcon($("play"), "pause", "Pause"); if (mode === "read") setMode("both"); save(); });
+    audio.addEventListener("pause", () => { setIcon($("play"), "play", "Play"); save(); });
     audio.addEventListener("error", () => { if (cur) toast("Couldn't play this segment; skipping it.", null, null, 4000); setTimeout(() => advance(true), 1500); });
     document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") save(); });
-
-    // The sentence a word sits in, so a pronunciation can be tried the way the segment says it.
-    function sentenceAt(i) {
-      const end = (w) => /[.!?]["'”’)]*$/.test(w.w);
-      let a = i, b = i;
-      while (a > 0 && words[a - 1].p === words[i].p && !end(words[a - 1])) a--;
-      while (b < words.length - 1 && words[b + 1].p === words[i].p && !end(words[b])) b++;
-      return words.slice(a, b + 1).map((w) => w.w).join(" ");
-    }
 
     $("play").onclick = () => { if (!cur) return; audio.paused ? play() : audio.pause(); };
 
