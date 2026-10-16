@@ -957,3 +957,22 @@ func b2i(b bool) int {
 	}
 	return 0
 }
+
+// rebuild clears the map and everything not yet heard, ready for a fresh plan.
+func (s *store) rebuild(ctx context.Context, c *Course) (int64, error) {
+	pos, _ := s.ownerPosition(ctx, c)
+	n, err := s.discardAfter(ctx, c.ID, pos, "")
+	if err != nil {
+		return 0, err
+	}
+	for _, q := range []string{
+		`DELETE FROM learn_nodes WHERE course_id=?`,
+		`DELETE FROM learn_jobs WHERE course_id=? AND status IN ('queued','running') AND kind IN ('script','extend','plan','voice')`,
+		`UPDATE learn_courses SET status='planning', session_id='', session_provider='', session_turns=0, steer='', error='' WHERE id=?`,
+	} {
+		if _, err := s.db.ExecContext(ctx, q, c.ID); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}

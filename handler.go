@@ -47,6 +47,7 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/courses/{id}", e.course(true, e.removeCourse))
 	mux.HandleFunc("POST /api/courses/{id}/calibration", e.course(true, e.answerCalibration))
 	mux.HandleFunc("POST /api/courses/{id}/retry", e.course(true, e.retryCourse))
+	mux.HandleFunc("POST /api/courses/{id}/rebuild", e.course(true, e.rebuildCourse))
 	mux.HandleFunc("GET /api/courses/{id}/queue", e.course(false, e.queue))
 	mux.HandleFunc("GET /api/courses/{id}/segments/{sid}", e.course(false, e.getSegment))
 	mux.HandleFunc("GET /api/courses/{id}/audio/{sid}", e.course(false, e.audio))
@@ -770,4 +771,27 @@ func (e *Engine) answerQuiz(w http.ResponseWriter, r *http.Request) {
 	e.poke()
 	q, _ = e.st.quiz(r.Context(), q.ID)
 	jsonOK(w, q)
+}
+
+// rebuildCourse re-plans the map from scratch (reading the learner's code when research is on): it drops
+// what hasn't been heard yet, starts a fresh teacher session, and keeps the level check, profile and notes.
+func (e *Engine) rebuildCourse(w http.ResponseWriter, r *http.Request) {
+	c := courseOf(r)
+	ctx := r.Context()
+	if c.Status != StatusActive && c.Status != StatusError {
+		jsonErr(w, http.StatusConflict, "this course is still being set up")
+		return
+	}
+	n, err := e.st.rebuild(ctx, c)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := e.st.enqueue(ctx, c.ID, "plan", 60, nil); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	e.poke()
+	e.log.Info().Str("course", c.ID).Int64("discarded", n).Msg("rebuilding the course map")
+	jsonOK(w, map[string]any{"status": StatusPlanning, "discarded": n})
 }

@@ -647,7 +647,13 @@
         } }, "Save"),
         h("button", { onclick: async () => { await api("courses/" + c.id, { method: "PATCH", body: { paused: !c.paused } }); refreshCourse(true); } }, c.paused ? "Resume generating" : "Pause generating"),
         h("button", { onclick: async () => { await api("courses/" + c.id, { method: "PATCH", body: { research: !c.research } }); toast(c.research ? "The teacher won't read your code or GitHub for this topic." : "The teacher can now read your code and GitHub (read-only)."); refreshCourse(true); } },
-          c.research ? "Stop reading my code" : "Let it read my code")),
+          c.research ? "Stop reading my code" : "Let it read my code"),
+        h("button", { onclick: async (ev) => {
+          const b = ev.currentTarget;
+          if (!b.dataset.armed) { b.dataset.armed = "1"; b.textContent = "Tap again: re-plan the map (unheard segments are dropped)"; return; }
+          try { await api("courses/" + c.id + "/rebuild", { method: "POST" }); toast("Re-planning the map" + (c.research ? " from your code and GitHub" : "") + ". New segments follow in a few minutes."); refreshCourse(true); }
+          catch (e) { toast(e.message); }
+        } }, c.research ? "Rebuild from my code" : "Rebuild the map")),
       h("div", { class: "field" }, h("span", { style: "font-weight:500" }, "Share (listen only)"), members,
         h("div", { class: "row", style: "flex-wrap:nowrap" }, memberInput, h("button", { onclick: async () => {
           if (!memberInput.value.trim()) return;

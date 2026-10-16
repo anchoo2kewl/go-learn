@@ -24,11 +24,14 @@ How to write for the ear:
 
 // researchNote tells a research-enabled turn what it may look at.
 func researchNote(dirs []string) string {
-	return `You can look things up before you answer, read-only:
+	return `You HAVE read access to the learner's code and GitHub in this session. Never say you can't see a
+repository or that you'll look later: look now. If something genuinely isn't there, say what you checked.
+You can look things up before you answer, read-only:
 - The learner's local code, in: ` + strings.Join(dirs, ", ") + ` (Read, Grep, Glob, and git log, show, diff, grep, blame).
 - GitHub, through the gh CLI as the learner (gh repo, pr, issue, release view and list, gh pr diff, gh search).
 When the topic, a question or the learner's work involves specific code, products, repos, PRs or issues, look
-them up first and teach from what is actually there, naming files, functions and repos in words. Keep lookups
+them up first and teach from what is actually there, naming files, functions and repos in words. Use git
+history (git log, blame) and merged PRs to explain how things evolved and why. Keep lookups
 focused: a few searches and reads, then teach. Never read code aloud symbol by symbol. Your final message must
 still be only the JSON object asked for.`
 }
@@ -70,7 +73,9 @@ Reply with only a JSON object, no prose and no code fences:
 
 func planPrompt(c *Course) string {
 	return teacherBrief + "\n\n" + courseBlock(c) + `
-Sketch a map of this topic for a learner who will listen for many hours. It is not a syllabus to work
+Sketch a map of this topic for a learner who will listen for many hours. If the topic involves the
+learner's own products or code and you can read it, explore it first (the main repos, their structure,
+key components and how they evolved) so the map is grounded in what's really there. It is not a syllabus to work
 through once: it's the territory you'll roam, coming back to ideas from new angles as they learn, and it
 will keep growing. Use the level-check answers to pitch where to begin. Write 6 to 8 modules, each with
 4 to 6 concepts, in a sensible starting order; later modules go deeper and more practical. Also write the first learner profile: what they know, gaps, misconceptions you
