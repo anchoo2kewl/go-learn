@@ -27,3 +27,6 @@ node_modules/
 __pycache__/
 tools/tts-bakeoff/out/
 tools/tts-bakeoff/models/
+tools/tts-bakeoff/page/*.m4a
+tools/tts-bakeoff/page/*.words.json
+tools/tts-bakeoff/page/clips.json

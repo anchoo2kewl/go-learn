@@ -1,0 +1,294 @@
+<title>Teacher Voice Bake-off</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=Familjen+Grotesk:wght@400;500;600&display=swap">
+<style>
+/* Layout: a reading room. Clip picker on top, the read-along text as the page, a transport bar docked at the bottom. */
+:root {
+  --bg: #f5f6f8;
+  --paper: #ffffff;
+  --ink: #1b2230;
+  --muted: #5d6677;
+  --line: #dde1e8;
+  --accent: #2f5bd3;
+  --mark: #ffe58a;
+  --mark-ink: #1b2230;
+  --spoken: #8a93a3;
+  --font-read: "Newsreader", "Iowan Old Style", Georgia, serif;
+  --font-ui: "Familjen Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11151c; --paper: #171c25; --ink: #e6e9ef; --muted: #9aa3b2; --line: #2a3140;
+    --accent: #8fb0ff; --mark: #6b5a17; --mark-ink: #fff6d6; --spoken: #6f7889; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11151c; --paper: #171c25; --ink: #e6e9ef; --muted: #9aa3b2; --line: #2a3140;
+  --accent: #8fb0ff; --mark: #6b5a17; --mark-ink: #fff6d6; --spoken: #6f7889; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--font-ui); font-size: 15px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 20px 140px;
+}
+.wrap { max-width: 720px; margin: 0 auto; display: grid; gap: 20px; }
+header h1 { font-family: var(--font-read); font-weight: 500; font-size: 1.9rem; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+header p { margin: 6px 0 0; color: var(--muted); line-height: 1.5; max-width: 62ch; }
+.eyebrow { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; }
+
+.clips { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: 8px; }
+.clip {
+  font: inherit; cursor: pointer; border: 1px solid var(--line); background: var(--paper); color: var(--ink);
+  border-radius: 10px; padding: 10px 6px 8px; display: grid; gap: 4px; justify-items: center;
+}
+.clip b { font-size: 1.25rem; font-weight: 600; }
+.clip small { color: var(--muted); font-size: 0.72rem; font-variant-numeric: tabular-nums; min-height: 1em; }
+.clip[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.clip:focus-visible, button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.now { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; justify-content: space-between; }
+.now h2 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+.modes { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.modes button { font: inherit; font-size: 0.85rem; border: 0; background: transparent; color: var(--muted); padding: 6px 12px; cursor: pointer; }
+.modes button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+
+.reader {
+  background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 22px 22px 8px;
+  font-family: var(--font-read); font-size: 1.22rem; line-height: 1.7; min-width: 0;
+}
+.reader p { margin: 0 0 1em; max-width: 65ch; }
+.reader.hidden-text p { filter: blur(6px); user-select: none; }
+.w { border-radius: 4px; cursor: pointer; transition: background-color 90ms linear; padding: 0 1px; margin: 0 -1px; }
+.reader.follow .w.done { color: var(--spoken); }
+.w.on { background: var(--mark); color: var(--mark-ink); }
+.empty { color: var(--muted); font-family: var(--font-ui); font-size: 0.95rem; padding-bottom: 14px; }
+
+.rate { display: grid; gap: 10px; background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+.stars { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.stars button { font: inherit; font-size: 1.5rem; line-height: 1; border: 0; background: none; cursor: pointer; color: var(--line); padding: 2px; }
+.stars button.lit { color: #e2a400; }
+.stars span { color: var(--muted); font-size: 0.85rem; margin-left: 8px; }
+.rate textarea { font: inherit; width: 100%; min-height: 64px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--bg); color: var(--ink); resize: vertical; }
+.saved { color: var(--muted); font-size: 0.8rem; min-height: 1.2em; }
+
+.bar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; background: var(--paper); border-top: 1px solid var(--line);
+  padding: 10px max(16px, env(safe-area-inset-right, 0px)) calc(10px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+}
+.bar .inner { max-width: 720px; margin: 0 auto; display: grid; gap: 6px; }
+.row { display: flex; align-items: center; gap: 10px; }
+.bar button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 999px; height: 40px; min-width: 40px; padding: 0 12px; cursor: pointer; }
+.bar .play { background: var(--ink); color: var(--paper); border-color: var(--ink); min-width: 64px; font-weight: 600; }
+.bar input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+.time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 0.8rem; min-width: 88px; text-align: right; }
+.back { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); bottom: calc(118px + env(safe-area-inset-bottom, 0px)); z-index: 6;
+  font: inherit; font-size: 0.85rem; border: 1px solid var(--accent); color: var(--accent); background: var(--paper); border-radius: 999px; padding: 8px 14px; cursor: pointer; }
+@media (prefers-reduced-motion: reduce) { .w { transition: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Audio Courses · M0 listening test</div>
+    <h1>Which teacher should you hear for 40 hours?</h1>
+    <p>Each letter is the same lesson passage, read by a different engine and voice. Which engine is which stays hidden until you're done. Listen to every clip and rate how natural and easy to follow it is. The text highlights each word as it's spoken. Tap any word to jump there.</p>
+  </header>
+
+  <div>
+    <div class="eyebrow" style="margin-bottom:8px">Clips</div>
+    <div class="clips" id="clips"><span class="empty">Loading clips…</span></div>
+  </div>
+
+  <div class="now">
+    <h2 id="now">Pick a clip to start</h2>
+    <div class="modes" role="group" aria-label="Mode">
+      <button id="m-both" aria-pressed="true">Read + listen</button>
+      <button id="m-listen" aria-pressed="false">Listen only</button>
+      <button id="m-read" aria-pressed="false">Read only</button>
+    </div>
+  </div>
+
+  <article class="reader follow" id="reader"><p class="empty">The passage appears here, with each word lit as it's spoken.</p></article>
+
+  <section class="rate" id="rate" hidden>
+    <div class="eyebrow" id="rate-title">Rate this clip</div>
+    <div class="stars" id="stars"></div>
+    <textarea id="note" placeholder="What stood out? Robotic spots, odd pronunciations (RTT, ACK, self-clocking), pacing, warmth…"></textarea>
+    <div class="saved" id="saved"></div>
+  </section>
+</div>
+
+<button class="back" id="back" hidden>Back to the voice</button>
+
+<div class="bar">
+  <div class="inner">
+    <div class="row">
+      <button id="rew" aria-label="Back 15 seconds">−15</button>
+      <button id="play" class="play">Play</button>
+      <button id="fwd" aria-label="Forward 15 seconds">+15</button>
+      <button id="rate-btn" aria-label="Playback speed">1×</button>
+      <span class="time" id="time">0:00 / 0:00</span>
+    </div>
+    <div class="row"><input type="range" id="seek" min="0" max="1000" value="0" aria-label="Position"></div>
+  </div>
+</div>
+
+<audio id="audio" preload="auto"></audio>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const audio = $("audio"), reader = $("reader");
+  const SPEEDS = [1, 1.25, 1.5, 2, 0.85];
+  const LABELS = ["", "Robotic", "Flat", "Fine", "Natural", "Could listen all day"];
+  let clips = [], cur = null, words = [], spans = [], lit = -1, follow = true, userScrolled = false, mode = "both";
+  let db = null, ratings = {};
+
+  const fmt = (t) => { t = Math.max(0, t || 0); return Math.floor(t / 60) + ":" + String(Math.floor(t % 60)).padStart(2, "0"); };
+
+  function renderClips() {
+    const box = $("clips"); box.textContent = "";
+    for (const c of clips) {
+      const b = document.createElement("button");
+      b.className = "clip"; b.setAttribute("aria-pressed", String(cur && cur.label === c.label));
+      const r = ratings[c.label];
+      b.innerHTML = "<b></b><small></small>";
+      b.querySelector("b").textContent = c.label;
+      b.querySelector("small").textContent = r && r.stars ? "★".repeat(r.stars) : "unrated";
+      b.onclick = () => select(c);
+      box.appendChild(b);
+    }
+  }
+
+  async function select(c) {
+    cur = c; lit = -1; renderClips();
+    $("now").textContent = "Clip " + c.label;
+    reader.innerHTML = '<p class="empty">Loading…</p>';
+    audio.src = c.audio;
+    try { words = await (await fetch(c.words)).json(); } catch { words = []; }
+    reader.textContent = ""; spans = [];
+    let p = -1, para = null;
+    words.forEach((w, i) => {
+      if (w.p !== p) { para = document.createElement("p"); reader.appendChild(para); p = w.p; }
+      const s = document.createElement("span"); s.className = "w"; s.textContent = w.w; s.dataset.i = i;
+      para.appendChild(s); para.appendChild(document.createTextNode(" ")); spans.push(s);
+    });
+    if (!words.length) reader.innerHTML = '<p class="empty">No word timings for this clip, so audio only.</p>';
+    $("rate").hidden = false; $("rate-title").textContent = "Rate clip " + c.label;
+    renderRating(); applyMode();
+  }
+
+  reader.addEventListener("click", (e) => {
+    const i = e.target.dataset && e.target.dataset.i; if (i == null) return;
+    audio.currentTime = words[+i].s + 0.01; userScrolled = false; $("back").hidden = true;
+    if (audio.paused) audio.play().catch(() => {});
+  });
+
+  // Binary search: the last word whose start is <= t.
+  function wordAt(t) {
+    let lo = 0, hi = words.length - 1, ans = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (words[m].s <= t) { ans = m; lo = m + 1; } else hi = m - 1; }
+    return ans;
+  }
+
+  function tick() {
+    if (words.length && mode !== "listen") {
+      const i = wordAt(audio.currentTime);
+      if (i !== lit) {
+        if (lit >= 0 && spans[lit]) spans[lit].classList.remove("on");
+        // Mark everything before the current word as spoken (cheap: only walk the changed range).
+        const a = Math.min(lit, i), b = Math.max(lit, i);
+        for (let k = Math.max(0, a); k <= b && k < spans.length; k++) spans[k].classList.toggle("done", k < i);
+        if (i >= 0 && spans[i]) {
+          spans[i].classList.add("on");
+          if (!userScrolled) {
+            const r = spans[i].getBoundingClientRect(), vh = innerHeight;
+            if (r.top < vh * 0.25 || r.bottom > vh * 0.62) spans[i].scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+          }
+        }
+        lit = i;
+      }
+    }
+    const d = audio.duration || 0;
+    $("time").textContent = fmt(audio.currentTime) + " / " + fmt(d);
+    if (d && !seeking) $("seek").value = String(Math.round((audio.currentTime / d) * 1000));
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // Pause auto-follow when the reader scrolls by hand; offer a way back.
+  addEventListener("wheel", () => { if (!audio.paused) { userScrolled = true; $("back").hidden = false; } }, { passive: true });
+  addEventListener("touchmove", () => { if (!audio.paused) { userScrolled = true; $("back").hidden = false; } }, { passive: true });
+  $("back").onclick = () => { userScrolled = false; $("back").hidden = true; if (spans[lit]) spans[lit].scrollIntoView({ block: "center", behavior: "smooth" }); };
+
+  function applyMode() {
+    for (const m of ["both", "listen", "read"]) $("m-" + m).setAttribute("aria-pressed", String(m === mode));
+    reader.classList.toggle("hidden-text", mode === "listen");
+    reader.classList.toggle("follow", mode === "both");
+    if (mode === "read") { audio.pause(); spans.forEach((s) => s.classList.remove("on", "done")); lit = -1; }
+  }
+  $("m-both").onclick = () => { mode = "both"; applyMode(); };
+  $("m-listen").onclick = () => { mode = "listen"; applyMode(); };
+  $("m-read").onclick = () => { mode = "read"; applyMode(); };
+
+  $("play").onclick = () => {
+    if (!cur) { if (clips[0]) select(clips[0]).then(() => audio.play().catch(() => {})); return; }
+    if (mode === "read") { mode = "both"; applyMode(); }
+    audio.paused ? audio.play().catch(() => {}) : audio.pause();
+  };
+  audio.onplay = () => { $("play").textContent = "Pause"; };
+  audio.onpause = () => { $("play").textContent = "Play"; };
+  $("rew").onclick = () => { audio.currentTime = Math.max(0, audio.currentTime - 15); };
+  $("fwd").onclick = () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 15); };
+  let si = 0;
+  $("rate-btn").onclick = () => { si = (si + 1) % SPEEDS.length; audio.playbackRate = SPEEDS[si]; $("rate-btn").textContent = SPEEDS[si] + "×"; };
+  let seeking = false;
+  $("seek").oninput = () => { seeking = true; };
+  $("seek").onchange = () => { if (audio.duration) audio.currentTime = (+$("seek").value / 1000) * audio.duration; seeking = false; };
+
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.setActionHandler("seekbackward", () => $("rew").click());
+    navigator.mediaSession.setActionHandler("seekforward", () => $("fwd").click());
+  }
+
+  // Ratings, kept in the page's database so they can be read back.
+  function renderRating() {
+    const r = (cur && ratings[cur.label]) || {};
+    const box = $("stars"); box.textContent = "";
+    for (let n = 1; n <= 5; n++) {
+      const b = document.createElement("button"); b.textContent = "★"; b.className = n <= (r.stars || 0) ? "lit" : "";
+      b.setAttribute("aria-label", n + " of 5: " + LABELS[n]); b.onclick = () => save({ stars: n });
+      box.appendChild(b);
+    }
+    const lab = document.createElement("span"); lab.textContent = r.stars ? LABELS[r.stars] : "Not rated yet"; box.appendChild(lab);
+    if (document.activeElement !== $("note")) $("note").value = r.note || "";
+    $("saved").textContent = db ? "" : "Ratings can't be saved in this view. Tell Claude your picks instead.";
+  }
+  let noteTimer = null;
+  $("note").addEventListener("input", () => { clearTimeout(noteTimer); noteTimer = setTimeout(() => save({ note: $("note").value.slice(0, 2000) }), 700); });
+  async function save(patch) {
+    if (!cur) return;
+    const label = cur.label;
+    ratings[label] = Object.assign({}, ratings[label], patch);
+    renderRating(); renderClips();
+    if (!db) return;
+    try {
+      await db.doc("ratings/" + label).set(Object.assign({ label }, ratings[label], { at: new Date().toISOString() }));
+      $("saved").textContent = "Saved";
+    } catch (e) { $("saved").textContent = "Couldn't save (" + (e && e.code || "error") + "). Your rating shows here but isn't stored."; }
+  }
+
+  fetch("clips.json").then((r) => r.json()).then((list) => { clips = list; renderClips(); })
+    .catch(() => { $("clips").innerHTML = '<span class="empty">Clips are missing from this page.</span>'; });
+
+  (async () => {
+    try { db = window.claude && (await window.claude.use("db")); } catch { db = null; }
+    if (!db) { if (cur) renderRating(); return; }
+    db.collection("ratings").onSnapshot((snap) => {
+      for (const d of snap.docs) { const v = d.data() || {}; ratings[d.id] = { stars: v.stars, note: v.note }; }
+      renderClips(); if (cur) renderRating();
+    }, () => {});
+  })();
+})();
+</script>
