@@ -870,7 +870,8 @@
       view.els.reader.classList.toggle("fixing", on);
     };
     view.els.fix = fix;
-    return h("section", { class: "stack" }, h("div", { class: "spread" }, h("h2", {}, "Now"), h("div", { class: "row" }, d.can_steer ? fix : null, view.els.modes)), view.els.reader);
+    return h("section", { class: "stack" }, h("div", { class: "spread" }, h("h2", {}, "Now"), h("div", { class: "row" }, d.can_steer ? fix : null,
+      d.can_steer ? h("button", { class: "quiet small", title: "Write this segment again from your code", onclick: () => player.rewriteCurrent() }, "Rewrite") : null, view.els.modes)), view.els.reader);
   }
 
   const player = (() => {
@@ -1011,13 +1012,14 @@
       let g;
       try { g = await api("courses/" + courseId + "/segments/" + cur.id); } catch { return false; }
       if (g.status !== "ready" || !g.audio_v || g.audio_v === cur.audio_v) return false;
-      const i = wordAt(audio.currentTime), playing = !audio.paused;
+      const i = wordAt(audio.currentTime), playing = !audio.paused, rewritten = g.script !== cur.script;
       cur = g; words = Array.isArray(g.words) ? g.words : [];
-      const at = i >= 0 && words[i] ? words[i].s : audio.currentTime;
+      const at = rewritten ? 0 : i >= 0 && words[i] ? words[i].s : audio.currentTime; // a rewrite starts from the top
       audio.src = "api/courses/" + courseId + "/audio/" + cur.id + "?v=" + encodeURIComponent(cur.audio_v);
       audio.onloadedmetadata = () => { audio.currentTime = Math.min(at, Math.max(0, audio.duration - 1)); audio.playbackRate = SPEEDS[speedIdx]; if (playing) audio.play().catch(() => {}); };
       renderReader();
-      toast("Now playing with your pronunciation fix.", null, null, 4000);
+      toast(rewritten ? "Here's the rewritten version." : "Now playing with your pronunciation fix.", null, null, 4000);
+      renderContents();
       return true;
     }
     let freshPoll = null;
@@ -1025,6 +1027,25 @@
       clearInterval(freshPoll);
       const until = Date.now() + 6 * 60000;
       freshPoll = setInterval(async () => { if (Date.now() > until || (await checkFresh())) clearInterval(freshPoll); refreshQueue(); }, 5000);
+    }
+    function rewriteCurrent() {
+      if (!cur || !view || !view.data || !view.data.can_steer) return;
+      const seg = cur;
+      const ta = h("textarea", { placeholder: "Optional: what should change? e.g. \"more about how the scanner actually works in our code\"" });
+      const go = h("button", { class: "primary" }, "Rewrite");
+      const close = openSheet("Rewrite “" + (seg.title || "this segment") + "”", h("p", { class: "muted small", style: "margin:0" },
+        "The teacher writes this segment again from your code, keeping its place in the course. Keep listening: the new version swaps in when it's ready (a couple of minutes) and starts from the top."), ta, h("div", { class: "row" }, go));
+      go.onclick = async () => {
+        go.disabled = true;
+        try {
+          await api("courses/" + courseId + "/segments/" + seg.id + "/rewrite", { method: "POST", body: { note: ta.value } });
+          close(); toast("Rewriting from your code. It'll swap in by itself.");
+          clearInterval(freshPoll);
+          const until = Date.now() + 10 * 60000;
+          freshPoll = setInterval(async () => { if (Date.now() > until || (await checkFresh())) clearInterval(freshPoll); }, 8000);
+        } catch (e) { toast(e.message); go.disabled = false; }
+      };
+      setTimeout(() => ta.focus(), 50);
     }
     setInterval(checkFresh, 30000);
 
@@ -1221,7 +1242,7 @@
     $("seek").oninput = () => { seeking = true; };
     $("seek").onchange = () => { if (audio.duration) audio.currentTime = (+$("seek").value / 1000) * audio.duration; seeking = false; };
 
-    return { attach, detach, refreshQueue, jumpTo, setMode, watchRevoice, currentId: () => (cur ? cur.id : ""), currentSeg: () => cur };
+    return { attach, detach, refreshQueue, jumpTo, setMode, watchRevoice, rewriteCurrent, currentId: () => (cur ? cur.id : ""), currentSeg: () => cur };
   })();
 
   // ---------- boot ----------

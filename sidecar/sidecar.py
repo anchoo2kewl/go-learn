@@ -202,11 +202,13 @@ def load_clip(path, sr):
 def synth_with_clips(voice, text, clips):
     """Say text, but wherever a word has an approved clip, play that exact clip instead of letting the
     model guess. The model can say a respelling right on its own and wrong mid-sentence, so the text
-    around each clip is voiced separately and joined with short gaps. A possessive 's is dropped."""
+    around each clip is voiced separately and joined with short gaps. "Elastio's" uses its own clip when
+    one is given; otherwise the 's is dropped."""
     import librosa
 
     if not clips:
         return synth(voice, text)
+    text = text.replace("’", "'")
     pat = re.compile(r"(?<![\w])(" + "|".join(re.escape(t) for t in sorted(clips, key=len, reverse=True)) + r")(?:['’]s)?(?![\w])", re.I)
     lower = {t.lower(): p for t, p in clips.items()}
     parts, pos = [], 0

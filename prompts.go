@@ -259,6 +259,35 @@ Reply with only a JSON object, no prose and no code fences:
 	return b.String()
 }
 
+// rewritePrompt asks for a better version of one segment, in place: same idea, same place in the course.
+func rewritePrompt(c *Course, g *Segment, concept *Node, recent []*Segment, note string) string {
+	var b strings.Builder
+	b.WriteString(teacherBrief + "\n\n" + courseBlock(c) + "\n" + profileBlock(c) + "\n\n")
+	if concept != nil {
+		fmt.Fprintf(&b, "This segment teaches the idea %q: %s\n\n", concept.Title, concept.Summary)
+	}
+	if len(recent) > 0 {
+		b.WriteString("What came just before it (summaries):\n")
+		for _, r := range recent {
+			fmt.Fprintf(&b, "- %s\n", r.Summary)
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "Rewrite this segment. Its current title: %q\nIts current script:\n%q\n\n", g.Title, g.Script)
+	if strings.TrimSpace(note) != "" {
+		fmt.Fprintf(&b, "What the learner wants changed: %q\n\n", note)
+	}
+	b.WriteString(`Keep the same idea and its place in the course, and about the same length (two to four minutes
+spoken). Ground it in what is actually in the learner's code and GitHub: look first, then teach from it, naming
+repos, files and functions in words. Drop anything in the old script that's wrong, vague, or says you can't see
+the code. "pronunciations" maps words in the script that a text-to-speech voice may say wrongly to how they
+should be said.
+
+Reply with only a JSON object, no prose and no code fences:
+{"title": "...", "script": "...", "summary": "one sentence", "pronunciations": {}}`)
+	return b.String()
+}
+
 func answerPrompt(c *Course, i *Interaction, current *Segment, recent []*Segment, upcoming []*Segment, x nextContext, resumed bool) string {
 	var b strings.Builder
 	if !resumed {

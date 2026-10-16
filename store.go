@@ -612,6 +612,13 @@ func (s *store) updateSegment(ctx context.Context, g *Segment) error {
 	return err
 }
 
+// rewriteSegment replaces a segment's text; its audio stays until the re-voice replaces it.
+func (s *store) rewriteSegment(ctx context.Context, g *Segment) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE learn_segments SET title=?, script=?, speech=?, summary=?, pron=?, llm=? WHERE id=?`,
+		g.Title, g.Script, g.Speech, g.Summary, string(g.Pron), g.LLM, g.ID)
+	return err
+}
+
 func (s *store) setSegmentStatus(ctx context.Context, id, status string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE learn_segments SET status=? WHERE id=?`, status, id)
 	return err

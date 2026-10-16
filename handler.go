@@ -52,6 +52,7 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("POST /api/courses/{id}/rebuild", e.course(true, e.rebuildCourse))
 	mux.HandleFunc("GET /api/courses/{id}/queue", e.course(false, e.queue))
 	mux.HandleFunc("GET /api/courses/{id}/segments/{sid}", e.course(false, e.getSegment))
+	mux.HandleFunc("POST /api/courses/{id}/segments/{sid}/rewrite", e.course(true, e.rewriteSegment))
 	mux.HandleFunc("GET /api/courses/{id}/audio/{sid}", e.course(false, e.audio))
 	mux.HandleFunc("PUT /api/courses/{id}/playback", e.course(false, e.putPlayback))
 	mux.HandleFunc("GET /api/courses/{id}/playback", e.course(false, e.getPlayback))
@@ -449,6 +450,30 @@ func (e *Engine) getSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, g)
+}
+
+// rewriteSegment: the owner asks for a segment to be written again (from the code), with an optional note.
+func (e *Engine) rewriteSegment(w http.ResponseWriter, r *http.Request) {
+	c := courseOf(r)
+	g, err := e.st.segment(r.Context(), r.PathValue("sid"))
+	if err != nil || g.CourseID != c.ID || g.Status == SegDiscarded {
+		jsonErr(w, http.StatusNotFound, "no such segment")
+		return
+	}
+	var in struct {
+		Note string `json:"note"`
+	}
+	_ = decode(r, &in)
+	if len(in.Note) > 2000 {
+		jsonErr(w, http.StatusBadRequest, "that note is too long")
+		return
+	}
+	if err := e.st.enqueue(r.Context(), c.ID, "rewrite", 92, map[string]string{"segment_id": g.ID, "note": strings.TrimSpace(in.Note)}); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	e.poke()
+	jsonOK(w, map[string]bool{"queued": true})
 }
 
 func (e *Engine) audio(w http.ResponseWriter, r *http.Request) {

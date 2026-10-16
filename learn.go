@@ -131,7 +131,7 @@ func (e *Engine) poke() {
 // Run starts the buffer controller and the workers; it returns when ctx ends.
 func (e *Engine) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	agentKinds := []string{"answer", "grade", "quiz", "calibrate", "plan", "extend", "script"}
+	agentKinds := []string{"answer", "rewrite", "grade", "quiz", "calibrate", "plan", "extend", "script"}
 	for i := 0; i < e.opt.agentWorkers; i++ {
 		wg.Add(1)
 		go func() { defer wg.Done(); e.worker(ctx, agentKinds) }()
@@ -208,6 +208,8 @@ func (e *Engine) do(ctx context.Context, j *Job) error {
 		return e.doQuiz(ctx, j)
 	case "grade":
 		return e.doGrade(ctx, j)
+	case "rewrite":
+		return e.doRewrite(ctx, j)
 	}
 	return fmt.Errorf("unknown job kind %q", j.Kind)
 }
@@ -675,6 +677,62 @@ func (e *Engine) addConcept(ctx context.Context, c *Course, modules, concepts []
 	}
 	n := &Node{CourseID: c.ID, ParentID: mod.ID, Kind: "concept", Ord: last + 0.5, Title: strings.TrimSpace(title), Summary: objectives}
 	return n, e.st.insertNode(ctx, n)
+}
+
+// doRewrite rewrites one segment in place, from the code, then re-voices it. The old audio keeps
+// playing until the new one is ready; the player then starts the new version from the top.
+func (e *Engine) doRewrite(ctx context.Context, j *Job) error {
+	var p struct {
+		SegmentID string `json:"segment_id"`
+		Note      string `json:"note"`
+	}
+	if err := json.Unmarshal(j.Payload, &p); err != nil {
+		return err
+	}
+	g, err := e.st.segment(ctx, p.SegmentID)
+	if err != nil {
+		return err
+	}
+	c, err := e.st.course(ctx, g.CourseID)
+	if err != nil {
+		return err
+	}
+	var concept *Node
+	if nodes, err := e.st.nodes(ctx, c.ID); err == nil {
+		for _, n := range nodes {
+			if n.ID == g.NodeID {
+				concept = n
+			}
+		}
+	}
+	recent, _ := e.st.recentSegments(ctx, c.ID, g.Ord-0.001, 3)
+	var out struct {
+		Title          string            `json:"title"`
+		Script         string            `json:"script"`
+		Summary        string            `json:"summary"`
+		Pronunciations map[string]string `json:"pronunciations"`
+	}
+	res, err := e.turn(ctx, c, "learn-"+c.ID+"-rewrite", "", "", func(bool) string { return rewritePrompt(c, g, concept, recent, p.Note) }, &out)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out.Script) == "" {
+		return errors.New("empty script")
+	}
+	g.Script = cleanScript(out.Script)
+	if t := strings.TrimSpace(out.Title); t != "" {
+		g.Title = t
+	}
+	if s := strings.TrimSpace(out.Summary); s != "" {
+		g.Summary = s
+	}
+	g.Speech = applyPronunciations(g.Script, out.Pronunciations)
+	g.Pron, _ = json.Marshal(out.Pronunciations)
+	g.LLM = llmLabel(res)
+	if err := e.st.rewriteSegment(ctx, g); err != nil {
+		return err
+	}
+	return e.st.enqueue(ctx, c.ID, "voice", 90, map[string]any{"segment_id": g.ID, "redo": true})
 }
 
 func (e *Engine) doVoice(ctx context.Context, j *Job) error {
@@ -1295,11 +1353,21 @@ func (e *Engine) speechFor(ctx context.Context, c *Course, g *Segment) (string, 
 	all, _ := e.st.lexicon(ctx, c.Owner)
 	clips := map[string]string{}
 	var lex []LexEntry
+	script := strings.ToLower(strings.ReplaceAll(g.Script, "’", "'"))
 	for _, l := range all {
-		if p := e.ensureClip(ctx, c.Owner, c.VoiceID, l); p != "" {
-			clips[l.Term] = p
-		} else {
+		p := e.ensureClip(ctx, c.Owner, c.VoiceID, l)
+		if p == "" {
 			lex = append(lex, l)
+			continue
+		}
+		clips[l.Term] = p
+		// "Elastio's" and "Elastios": the word said alone with an s on the end, in its own clip.
+		for _, form := range []string{l.Term + "'s", l.Term + "s"} {
+			if strings.Contains(script, strings.ToLower(form)) {
+				if q := e.ensureClip(ctx, c.Owner, c.VoiceID, LexEntry{Term: form, Say: speakable(l.Say) + "s"}); q != "" {
+					clips[form] = q
+				}
+			}
 		}
 	}
 	return e.speechText(c, g, all, lex), clips
