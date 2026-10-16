@@ -2,6 +2,11 @@
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
+  // Optional pieces are passed as null/false; never let the DOM turn them into the text "null".
+  for (const m of ["replaceChildren", "append", "prepend"]) {
+    const orig = Element.prototype[m];
+    Element.prototype[m] = function (...kids) { return orig.apply(this, kids.filter((k) => k != null && k !== false)); };
+  }
   const app = $("app"), audio = $("audio");
   const SPEEDS = [1, 1.15, 1.3, 1.5, 1.75, 2, 0.85];
   const store = {
