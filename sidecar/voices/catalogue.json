@@ -1,0 +1,5 @@
+[
+  {"id": "qwen3-us-male", "engine": "qwen3", "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16", "label": "American male, warm teacher", "accent": "us", "gender": "male", "ref_audio": "qwen3-us-male.wav", "ref_text": "Hello, and welcome back. Today we're going to look at how computers share a network fairly, and why a few simple rules turn out to be surprisingly powerful."},
+  {"id": "kokoro-us-female", "engine": "kokoro", "model": "mlx-community/Kokoro-82M-bf16", "label": "American female", "accent": "us", "gender": "female", "preset": "af_heart", "lang_code": "a"},
+  {"id": "kokoro-us-male", "engine": "kokoro", "model": "mlx-community/Kokoro-82M-bf16", "label": "American male", "accent": "us", "gender": "male", "preset": "am_michael", "lang_code": "a"}
+]

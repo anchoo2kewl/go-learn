@@ -60,16 +60,14 @@ REF_TEXT = (
     "and why a few simple rules turn out to be surprisingly powerful."
 )
 
-# Highest-quality build of each engine that fits in the M4 Max's 36 GB (one model loaded at a time).
-# Drama 3 (35B MoE) fits only at 4-bit; everything else runs at full bf16 precision.
+# Chosen in M0 (blind): Qwen3-TTS American male and Kokoro American female/male. Breeze TTS 2 (7.6 GB) was
+# tested and not picked.
+# Best sound per gigabyte of disk, at full bf16 precision. Left out on size or rank: Fish Audio Drama 3
+# (arena #1 but 23.8 GB at 4-bit, only ~22 Elo above Breeze 2), Fish S2 Pro (11 GB), Voxtral 4B (8 GB),
+# VoxCPM2 (unranked, 1.2x realtime).
 ENGINES = {
-    "drama3": "mlx-community/fish-audio-drama-3-4bit",
-    "breeze2": "mlx-community/Breeze-TTS-2-mlx",
-    "s2pro": "mlx-community/fish-audio-s2-pro-bf16",
-    "voxtral": "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16",
-    "qwen3": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
-    "voxcpm2": "mlx-community/VoxCPM2-bf16",
-    "kokoro": "mlx-community/Kokoro-82M-bf16",
+    "qwen3": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",  # 4.5 GB, Apache-2.0
+    "kokoro": "mlx-community/Kokoro-82M-bf16",  # 0.3 GB, baseline
 }
 ROUND1_VOICES = ["us_f", "us_m"]
 DESIGN_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
