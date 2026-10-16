@@ -3,6 +3,7 @@ package learn
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // The teacher's standing instructions. They go at the top of every new session; resumed sessions
@@ -58,10 +59,10 @@ Reply with only a JSON object, no prose and no code fences:
 
 func planPrompt(c *Course) string {
 	return teacherBrief + "\n\n" + courseBlock(c) + `
-Plan this course as a curriculum the learner will listen to for many hours. Use the level-check answers
-to skip what they know and start at the right depth. Write 6 to 8 modules, each with 4 to 6 concepts, in
-teaching order; each concept should take roughly 10 to 25 minutes of listening. Later modules go deeper
-and more practical. Also write the first learner profile: what they know, gaps, misconceptions you
+Sketch a map of this topic for a learner who will listen for many hours. It is not a syllabus to work
+through once: it's the territory you'll roam, coming back to ideas from new angles as they learn, and it
+will keep growing. Use the level-check answers to pitch where to begin. Write 6 to 8 modules, each with
+4 to 6 concepts, in a sensible starting order; later modules go deeper and more practical. Also write the first learner profile: what they know, gaps, misconceptions you
 suspect, and how to pitch the teaching. Give each concept your estimate of the learner's mastery (0 to 1).
 
 Reply with only a JSON object, no prose and no code fences:
@@ -74,66 +75,157 @@ Reply with only a JSON object, no prose and no code fences:
 func extendPrompt(c *Course, done []string) string {
 	return teacherBrief + "\n\n" + courseBlock(c) + "\n" + profileBlock(c) + `
 
-The learner has finished the curriculum so far. Modules covered:
+The map is getting well covered. Modules so far:
 - ` + strings.Join(done, "\n- ") + `
 
-Plan the next 3 modules: go deeper, cover adjacent topics the learner would benefit from, and include at
-least one practical, real-world module (case studies, incidents, hands-on reasoning). Don't repeat
-what's covered.
+Add 3 more modules to the map: go deeper, cover adjacent topics the learner would benefit from given
+their profile and questions, and include at least one practical, real-world module (case studies,
+incidents, hands-on reasoning). Don't duplicate concepts already on the map.
 
 Reply with only a JSON object, no prose and no code fences:
 {"modules": [{"title": "...", "summary": "...", "concepts": [{"title": "...", "objectives": "...", "mastery": 0.0}]}]}`
 }
 
-// segmentContext is what a script turn needs to know about where the course is.
-type segmentContext struct {
-	Module, Concept     *Node
-	NewConcept          bool
-	Recent              []*Segment
-	Reviews             []*Node
-	CheckinDue          bool
-	NextConceptTitle    string
-	ModuleIndex, Of     int
-	ConceptIndex, OfCon int
+// nextContext is what the teacher needs to decide and write the next segment.
+type nextContext struct {
+	Modules       []*Node
+	Concepts      []*Node
+	Recent        []*Segment
+	Asked         []*Interaction
+	Suggestion    *Node
+	Steer         string
+	CheckinDue    bool
+	SegmentsSoFar int
+	InPlay        map[string]bool // concept ids the turn is likely about: full detail for these
+	Notes         []*Note         // what we know about the learner, on the concepts in play
+	Past          []*Interaction  // older questions about the concepts in play
 }
 
-func scriptPrompt(c *Course, x segmentContext, resumed bool) string {
+// mapBlock renders the map within a budget: small maps in full; big ones in full only for the modules
+// in play, and otherwise just the weak, stale or fresh ideas plus a one-line summary per module.
+func mapBlock(modules, concepts []*Node, inPlay map[string]bool) string {
+	var b strings.Builder
+	b.WriteString("Map of the topic (module › concept — mastery 0-1, times covered, last covered):\n")
+	full := len(concepts) <= 50
+	for _, m := range modules {
+		var mine []*Node
+		hot := false
+		for _, n := range concepts {
+			if n.ParentID == m.ID {
+				mine = append(mine, n)
+				hot = hot || inPlay[n.ID]
+			}
+		}
+		fmt.Fprintf(&b, "%s\n", m.Title)
+		shown, sum, fresh := 0, 0.0, 0
+		for _, n := range mine {
+			sum += n.Mastery
+			if n.Covered == 0 {
+				fresh++
+			}
+			stale := n.Covered > 0 && strings.HasSuffix(ago(n.LastCoveredAt), "days ago")
+			if full || hot || inPlay[n.ID] || (n.Covered > 0 && n.Mastery < 0.5) || stale || (n.Covered == 0 && fresh <= 2) {
+				fmt.Fprintf(&b, "  › %s — %.1f, %d×, %s\n", n.Title, n.Mastery, n.Covered, ago(n.LastCoveredAt))
+				shown++
+			}
+		}
+		if hidden := len(mine) - shown; hidden > 0 {
+			fmt.Fprintf(&b, "  (%d more here; average mastery %.1f; %d not yet covered)\n", hidden, sum/float64(max(1, len(mine))), fresh)
+		}
+	}
+	return b.String()
+}
+
+func notesBlock(notes []*Note, titles map[string]string) string {
+	if len(notes) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("What you've learned about this learner, relevant here:\n")
+	for _, n := range notes {
+		about := ""
+		if t := titles[n.NodeID]; t != "" {
+			about = " (" + t + ")"
+		}
+		fmt.Fprintf(&b, "- %s%s: %s\n", n.Kind, about, n.Text)
+	}
+	return b.String()
+}
+
+func ago(ts string) string {
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return "never"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%d min ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%d h ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%d days ago", int(d.Hours()/24))
+}
+
+// nextPrompt: this course is not a book. Each segment, the teacher decides what this learner needs
+// now — continue the thread, revisit an idea from a new angle, go deeper, review, or branch out —
+// and writes it.
+func nextPrompt(c *Course, x nextContext, resumed bool) string {
 	var b strings.Builder
 	if !resumed {
-		b.WriteString(teacherBrief + "\n\n" + courseBlock(c) + "\n")
-		fmt.Fprintf(&b, "You're teaching module %d of %d: %q — %s\n", x.ModuleIndex, x.Of, x.Module.Title, x.Module.Summary)
+		b.WriteString(teacherBrief + "\n\n" + courseBlock(c) + `
+This course is not a book with chapters to finish. It is an endless, adaptive stream: before each
+segment you decide what this learner needs next. You may continue the current thread, come back to an
+idea from a fresh angle (repetition from new angles is good teaching), go deeper, run a quick review,
+connect two ideas, or branch into something new. Let the learner's questions and answers steer you.
+`)
 	}
-	b.WriteString(profileBlock(c) + "\n\n")
+	b.WriteString("\n" + profileBlock(c) + "\n\n")
+	b.WriteString(mapBlock(x.Modules, x.Concepts, x.InPlay))
+	titles := map[string]string{}
+	for _, n := range x.Concepts {
+		titles[n.ID] = n.Title
+	}
+	if nb := notesBlock(x.Notes, titles); nb != "" {
+		b.WriteString("\n" + nb)
+	}
+	if len(x.Past) > 0 {
+		b.WriteString("\nEarlier questions of theirs on these ideas:\n")
+		for _, i := range x.Past {
+			fmt.Fprintf(&b, "- %q\n", i.Text)
+		}
+	}
 	if len(x.Recent) > 0 {
-		b.WriteString("What the learner has just heard, most recent last (summaries):\n")
+		b.WriteString("\nWhat the learner has just heard, most recent last:\n")
 		for _, g := range x.Recent {
 			fmt.Fprintf(&b, "- [%s] %s\n", g.Kind, g.Summary)
 		}
-		b.WriteString("\n")
-	}
-	if x.NewConcept {
-		fmt.Fprintf(&b, "Start concept %d of %d in this module: %q. Objectives: %s\n", x.ConceptIndex, x.OfCon, x.Concept.Title, x.Concept.Summary)
 	} else {
-		fmt.Fprintf(&b, "Continue concept %q (objectives: %s) from where the last segment stopped.\n", x.Concept.Title, x.Concept.Summary)
+		b.WriteString("\nThis is the very first segment. Welcome them briefly, connect to what they told you, and begin.\n")
 	}
-	fmt.Fprintf(&b, "The learner's estimated mastery of it: %.1f.\n", x.Concept.Mastery)
-	if len(x.Reviews) > 0 {
-		b.WriteString("Weave in a brief spaced-repetition callback to one of these earlier concepts where it fits naturally: ")
-		for i, r := range x.Reviews {
-			if i > 0 {
-				b.WriteString("; ")
+	if len(x.Asked) > 0 {
+		b.WriteString("\nWhat the learner has said recently, most recent first:\n")
+		for _, i := range x.Asked {
+			v := ""
+			if i.Verdict != "" {
+				v = " (" + i.Verdict + ")"
 			}
-			b.WriteString(r.Title)
+			fmt.Fprintf(&b, "- %s%s: %q\n", i.Kind, v, i.Text)
 		}
-		b.WriteString(".\n")
 	}
-	if x.NextConceptTitle != "" {
-		fmt.Fprintf(&b, "(The concept after this one is %q.)\n", x.NextConceptTitle)
+	if x.Steer != "" {
+		fmt.Fprintf(&b, "\nThe learner asked for this next: %s\n", x.Steer)
+	}
+	if x.Suggestion != nil {
+		fmt.Fprintf(&b, "\nIf nothing above suggests otherwise, a sensible default is: %q.\n", x.Suggestion.Title)
 	}
 	b.WriteString(`
-Write the next segment: about 400 to 500 spoken words (roughly three minutes). End at a natural pause.
-Set concept_done to true when this concept has been taught well enough to move on (usually after 3 to 6
-segments; fewer if the learner already knows it well).`)
+Decide what comes next, then write it: about 400 to 500 spoken words (roughly three minutes), ending at
+a natural pause. Make transitions explicit when you change subject ("let's come back to…", "now that
+you've got X, here's where it gets interesting…").
+Put the exact map concept title you're teaching in "focus". If you're branching into something that
+isn't on the map, describe it in "new_concept" (and give its title as "focus"); name the module it
+belongs to, or a new module title.`)
 	if x.CheckinDue {
 		b.WriteString(` End this segment with a short check-in question the learner can answer out loud or by typing
 (recall, or "explain it back in your own words"), and put that question in "checkin" too. Tell them to
@@ -144,24 +236,31 @@ List any technical terms a text-to-speech voice might mispronounce in "pronuncia
 as written to how it should be said (e.g. {"etcd": "et-see-dee", "nginx": "engine-x"}).
 
 Reply with only a JSON object, no prose and no code fences:
-{"title": "a short title for this segment", "script": "the spoken text, paragraphs separated by blank lines",
- "summary": "one or two sentences: what this segment taught", "concept_done": false, "checkin": "",
- "pronunciations": {}}`)
+{"move": "continue|revisit|deeper|review|connect|new", "focus": "exact concept title",
+ "new_concept": {"title": "", "objectives": "", "module": ""},
+ "title": "a short title for this segment", "script": "the spoken text, paragraphs separated by blank lines",
+ "summary": "one or two sentences: what this segment taught", "checkin": "", "pronunciations": {}}`)
 	return b.String()
 }
 
-func answerPrompt(c *Course, i *Interaction, current *Segment, recent []*Segment, upcoming []*Segment, curriculum []*Node, resumed bool) string {
+func answerPrompt(c *Course, i *Interaction, current *Segment, recent []*Segment, upcoming []*Segment, x nextContext, resumed bool) string {
 	var b strings.Builder
 	if !resumed {
 		b.WriteString(teacherBrief + "\n\n" + courseBlock(c) + "\n")
 	}
 	b.WriteString(profileBlock(c) + "\n\n")
-	if len(curriculum) > 0 {
-		b.WriteString("Curriculum concepts (exact titles; status; estimated mastery):\n")
-		for _, n := range curriculum {
-			if n.Kind == "concept" {
-				fmt.Fprintf(&b, "- %s (%s, %.1f)\n", n.Title, n.Status, n.Mastery)
-			}
+	b.WriteString(mapBlock(x.Modules, x.Concepts, x.InPlay) + "\n")
+	titles := map[string]string{}
+	for _, n := range x.Concepts {
+		titles[n.ID] = n.Title
+	}
+	if nb := notesBlock(x.Notes, titles); nb != "" {
+		b.WriteString(nb + "\n")
+	}
+	if len(x.Past) > 0 {
+		b.WriteString("Their earlier questions on these ideas:\n")
+		for _, p := range x.Past {
+			fmt.Fprintf(&b, "- %q\n", p.Text)
 		}
 		b.WriteString("\n")
 	}
@@ -195,14 +294,64 @@ Then decide what happens to the prepared segments: "keep" if they still fit, or 
 changes direction (they already know it, want more depth, want to switch focus, or are confused).`)
 	}
 	b.WriteString(`
-Update the learner profile with anything this reveals (as a complete replacement JSON object), and give
-mastery estimates (0 to 1) for any concepts this tells you about, by exact concept title.
+Update the learner profile with anything this reveals (as a complete replacement JSON object, under 250
+words; keep it a compact summary, the details belong in notes), and give mastery estimates (0 to 1) for any
+concepts this tells you about, by exact concept title. Record what this tells you about the learner as
+short notes, each tagged to an exact concept title where it applies: kind is one of misconception, gap,
+strength, interest, preference. Put the concept this exchange is mainly about in "about".
 If the learner already knows concepts, list their exact titles in "known" so the course skips them. If
 they asked to focus on a concept that comes later, put its exact title in "next_concept" so it's taught next.
 
 Reply with only a JSON object, no prose and no code fences:
 {"title": "short title", "script": "the spoken reply, paragraphs separated by blank lines", "summary": "one sentence",
- "verdict": "", "replan": "keep", "profile": {}, "mastery": {"concept title": 0.5}, "known": [], "next_concept": "",
+ "verdict": "", "replan": "keep", "about": "exact concept title", "profile": {}, "mastery": {"concept title": 0.5},
+ "notes": [{"concept": "exact concept title or empty", "kind": "gap", "text": "..."}], "known": [], "next_concept": "",
  "pronunciations": {}}`)
 	return b.String()
+}
+
+func quizPrompt(c *Course, x nextContext, recent []*Segment, focus *Node) string {
+	var b strings.Builder
+	b.WriteString(courseBlock(c) + "\n" + profileBlock(c) + "\n\n" + mapBlock(x.Modules, x.Concepts, x.InPlay) + "\n")
+	titles := map[string]string{}
+	for _, n := range x.Concepts {
+		titles[n.ID] = n.Title
+	}
+	b.WriteString(notesBlock(x.Notes, titles))
+	if len(recent) > 0 {
+		b.WriteString("\nWhat the learner has heard recently (summaries):\n")
+		for _, g := range recent {
+			fmt.Fprintf(&b, "- %s\n", g.Summary)
+		}
+	}
+	if focus != nil {
+		fmt.Fprintf(&b, "\nThe learner asked to be quizzed on: %q.\n", focus.Title)
+	} else {
+		b.WriteString("\nQuiz what they've actually heard, weighted towards weak, stale or misunderstood ideas.\n")
+	}
+	b.WriteString(`
+Write a 5-question quiz that makes the learner retrieve and apply ideas, not recognise wording: 3
+multiple-choice questions (4 options, one correct, plausible distractors drawn from real misconceptions)
+and 2 short-answer questions answerable in a sentence or two. Tag each with the exact concept title.
+
+Reply with only a JSON object, no prose and no code fences:
+{"questions": [
+  {"type": "mc", "concept": "exact title", "q": "...", "options": ["...", "...", "...", "..."], "answer": 0, "explain": "why the right one is right and the others aren't"},
+  {"type": "short", "concept": "exact title", "q": "...", "model_answer": "...", "rubric": "what a correct answer must contain"}]}`)
+	return b.String()
+}
+
+func gradePrompt(c *Course, items string) string {
+	return courseBlock(c) + "\n" + profileBlock(c) + `
+
+Grade the learner's short answers to these quiz questions. Be fair: credit the idea even if the wording
+differs. For each, give a verdict (correct, partial or wrong) and one or two sentences of feedback that
+teach the missing piece. Then record what the answers reveal about the learner as short notes tagged to
+exact concept titles (kind: misconception, gap or strength).
+
+` + items + `
+
+Reply with only a JSON object, no prose and no code fences:
+{"results": [{"i": <the question's i>, "verdict": "correct", "feedback": "..."}],
+ "notes": [{"concept": "exact concept title", "kind": "misconception", "text": "..."}]}`
 }

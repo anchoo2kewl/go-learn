@@ -108,6 +108,43 @@ var schema = []string{
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS learn_jobs_queue ON learn_jobs(status, priority, id)`,
+	// What the course has learned about the learner, tagged to concepts so only relevant notes are
+	// loaded into a turn.
+	`CREATE TABLE IF NOT EXISTS learn_notes (
+		id TEXT PRIMARY KEY,
+		course_id TEXT NOT NULL,
+		node_id TEXT NOT NULL DEFAULT '',
+		kind TEXT NOT NULL,
+		text TEXT NOT NULL,
+		source TEXT NOT NULL DEFAULT '',
+		resolved INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS learn_notes_course ON learn_notes(course_id, node_id, resolved)`,
+	`CREATE TABLE IF NOT EXISTS learn_quizzes (
+		id TEXT PRIMARY KEY,
+		course_id TEXT NOT NULL,
+		node_id TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL,
+		questions TEXT NOT NULL DEFAULT '[]',
+		answers TEXT NOT NULL DEFAULT '[]',
+		results TEXT NOT NULL DEFAULT '[]',
+		score REAL NOT NULL DEFAULT 0,
+		error TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS learn_quizzes_course ON learn_quizzes(course_id, created_at)`,
+}
+
+// columns added after the first release; "duplicate column" errors are expected and ignored.
+var alters = []string{
+	`ALTER TABLE learn_courses ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE learn_courses ADD COLUMN session_provider TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE learn_courses ADD COLUMN session_turns INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE learn_courses ADD COLUMN steer TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE learn_nodes ADD COLUMN covered INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE learn_nodes ADD COLUMN last_covered_at TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE learn_playback ADD COLUMN device TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE learn_interactions ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`,
 }
 
 // Course statuses.
@@ -145,6 +182,10 @@ type Course struct {
 	Paused      bool            `json:"paused"`
 	CreatedAt   string          `json:"created_at"`
 	UpdatedAt   string          `json:"updated_at"`
+	SessionID   string          `json:"-"`
+	SessionProv string          `json:"-"`
+	SessionN    int             `json:"-"`
+	Steer       string          `json:"steer"`
 }
 
 type Calibration struct {
@@ -172,6 +213,8 @@ type Node struct {
 	LastRecallAt   string  `json:"last_recall_at"`
 	SessionID      string  `json:"-"`
 	SessionProv    string  `json:"-"`
+	Covered        int     `json:"covered"`
+	LastCoveredAt  string  `json:"last_covered_at"`
 }
 
 type Segment struct {
@@ -210,9 +253,11 @@ type Interaction struct {
 	AnswerSegmentID string `json:"answer_segment_id"`
 	Verdict         string `json:"verdict"`
 	CreatedAt       string `json:"created_at"`
+	NodeID          string `json:"node_id"`
 }
 
 type Playback struct {
+	Device    string  `json:"device"`
 	SegmentID string  `json:"segment_id"`
 	OffsetMs  int64   `json:"offset_ms"`
 	Rate      float64 `json:"rate"`
@@ -246,6 +291,11 @@ func (s *store) migrate(ctx context.Context) error {
 			return fmt.Errorf("learn: migrate: %w", err)
 		}
 	}
+	for _, q := range alters {
+		if _, err := s.db.ExecContext(ctx, q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("learn: migrate: %w", err)
+		}
+	}
 	// Jobs that were running when the process stopped go back to the queue.
 	_, err := s.db.ExecContext(ctx, `UPDATE learn_jobs SET status='queued' WHERE status='running'`)
 	if err == nil {
@@ -256,14 +306,14 @@ func (s *store) migrate(ctx context.Context) error {
 
 // ---- courses ----
 
-const courseCols = `id, owner, title, topic, goal, background, voice_id, provider, model, status, calibration, profile, error, paused, created_at, updated_at`
+const courseCols = `id, owner, title, topic, goal, background, voice_id, provider, model, status, calibration, profile, error, paused, created_at, updated_at, session_id, session_provider, session_turns, steer`
 
 func scanCourse(row interface{ Scan(...any) error }) (*Course, error) {
 	var c Course
 	var cal, prof string
 	var paused int
 	if err := row.Scan(&c.ID, &c.Owner, &c.Title, &c.Topic, &c.Goal, &c.Background, &c.VoiceID, &c.Provider, &c.Model,
-		&c.Status, &cal, &prof, &c.Error, &paused, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		&c.Status, &cal, &prof, &c.Error, &paused, &c.CreatedAt, &c.UpdatedAt, &c.SessionID, &c.SessionProv, &c.SessionN, &c.Steer); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errNotFound
 		}
@@ -281,8 +331,8 @@ func scanCourse(row interface{ Scan(...any) error }) (*Course, error) {
 func (s *store) createCourse(ctx context.Context, c *Course) error {
 	c.ID, c.CreatedAt, c.UpdatedAt = newID(), now(), now()
 	cal, _ := json.Marshal(c.Calibration)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_courses (`+courseCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.Owner, c.Title, c.Topic, c.Goal, c.Background, c.VoiceID, c.Provider, c.Model, c.Status, string(cal), "{}", "", 0, c.CreatedAt, c.UpdatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_courses (`+courseCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.Owner, c.Title, c.Topic, c.Goal, c.Background, c.VoiceID, c.Provider, c.Model, c.Status, string(cal), "{}", "", 0, c.CreatedAt, c.UpdatedAt, "", "", 0, "")
 	return err
 }
 
@@ -330,7 +380,7 @@ func (s *store) updateCourse(ctx context.Context, id string, set map[string]any)
 	cols, args := []string{}, []any{}
 	for k, v := range set {
 		switch k {
-		case "title", "status", "error", "voice_id", "provider", "model", "paused":
+		case "title", "status", "error", "voice_id", "provider", "model", "paused", "session_id", "session_provider", "session_turns", "steer":
 		case "calibration", "profile":
 			if b, ok := v.([]byte); ok {
 				v = string(b)
@@ -351,7 +401,7 @@ func (s *store) updateCourse(ctx context.Context, id string, set map[string]any)
 }
 
 func (s *store) deleteCourse(ctx context.Context, id string) error {
-	for _, t := range []string{"learn_members", "learn_nodes", "learn_segments", "learn_interactions", "learn_playback", "learn_jobs"} {
+	for _, t := range []string{"learn_members", "learn_nodes", "learn_segments", "learn_interactions", "learn_playback", "learn_jobs", "learn_notes", "learn_quizzes"} {
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM `+t+` WHERE course_id=?`, id); err != nil {
 			return err
 		}
@@ -396,12 +446,12 @@ func (s *store) setMember(ctx context.Context, course, user string, on bool) err
 
 // ---- nodes ----
 
-const nodeCols = `id, course_id, parent_id, kind, ord, title, summary, status, mastery, correct_recalls, last_recall_at, session_id, session_provider`
+const nodeCols = `id, course_id, parent_id, kind, ord, title, summary, status, mastery, correct_recalls, last_recall_at, session_id, session_provider, covered, last_covered_at`
 
 func scanNode(row interface{ Scan(...any) error }) (*Node, error) {
 	var n Node
 	err := row.Scan(&n.ID, &n.CourseID, &n.ParentID, &n.Kind, &n.Ord, &n.Title, &n.Summary, &n.Status, &n.Mastery,
-		&n.CorrectRecalls, &n.LastRecallAt, &n.SessionID, &n.SessionProv)
+		&n.CorrectRecalls, &n.LastRecallAt, &n.SessionID, &n.SessionProv, &n.Covered, &n.LastCoveredAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, errNotFound
 	}
@@ -415,8 +465,8 @@ func (s *store) insertNode(ctx context.Context, n *Node) error {
 	if n.Status == "" {
 		n.Status = "pending"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		n.ID, n.CourseID, n.ParentID, n.Kind, n.Ord, n.Title, n.Summary, n.Status, n.Mastery, n.CorrectRecalls, n.LastRecallAt, n.SessionID, n.SessionProv)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		n.ID, n.CourseID, n.ParentID, n.Kind, n.Ord, n.Title, n.Summary, n.Status, n.Mastery, n.CorrectRecalls, n.LastRecallAt, n.SessionID, n.SessionProv, n.Covered, n.LastCoveredAt)
 	return err
 }
 
@@ -442,8 +492,8 @@ func (s *store) node(ctx context.Context, id string) (*Node, error) {
 }
 
 func (s *store) updateNode(ctx context.Context, n *Node) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE learn_nodes SET status=?, mastery=?, correct_recalls=?, last_recall_at=?, session_id=?, session_provider=?, summary=? WHERE id=?`,
-		n.Status, n.Mastery, n.CorrectRecalls, n.LastRecallAt, n.SessionID, n.SessionProv, n.Summary, n.ID)
+	_, err := s.db.ExecContext(ctx, `UPDATE learn_nodes SET status=?, mastery=?, correct_recalls=?, last_recall_at=?, session_id=?, session_provider=?, summary=?, covered=?, last_covered_at=? WHERE id=?`,
+		n.Status, n.Mastery, n.CorrectRecalls, n.LastRecallAt, n.SessionID, n.SessionProv, n.Summary, n.Covered, n.LastCoveredAt, n.ID)
 	return err
 }
 
@@ -576,15 +626,15 @@ func (s *store) segmentCounts(ctx context.Context, course string) (ready int, re
 
 func (s *store) insertInteraction(ctx context.Context, i *Interaction) error {
 	i.ID, i.CreatedAt = newID(), now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_interactions (id, course_id, user_id, kind, segment_id, offset_ms, text, status, answer_segment_id, verdict, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`, i.ID, i.CourseID, i.UserID, i.Kind, i.SegmentID, i.OffsetMs, i.Text, i.Status, i.AnswerSegmentID, i.Verdict, i.CreatedAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_interactions (id, course_id, user_id, kind, segment_id, offset_ms, text, status, answer_segment_id, verdict, created_at, node_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, i.ID, i.CourseID, i.UserID, i.Kind, i.SegmentID, i.OffsetMs, i.Text, i.Status, i.AnswerSegmentID, i.Verdict, i.CreatedAt, i.NodeID)
 	return err
 }
 
 func (s *store) interaction(ctx context.Context, id string) (*Interaction, error) {
 	var i Interaction
-	err := s.db.QueryRowContext(ctx, `SELECT id, course_id, user_id, kind, segment_id, offset_ms, text, status, answer_segment_id, verdict, created_at
-		FROM learn_interactions WHERE id=?`, id).Scan(&i.ID, &i.CourseID, &i.UserID, &i.Kind, &i.SegmentID, &i.OffsetMs, &i.Text, &i.Status, &i.AnswerSegmentID, &i.Verdict, &i.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id, course_id, user_id, kind, segment_id, offset_ms, text, status, answer_segment_id, verdict, created_at, node_id
+		FROM learn_interactions WHERE id=?`, id).Scan(&i.ID, &i.CourseID, &i.UserID, &i.Kind, &i.SegmentID, &i.OffsetMs, &i.Text, &i.Status, &i.AnswerSegmentID, &i.Verdict, &i.CreatedAt, &i.NodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, errNotFound
 	}
@@ -592,8 +642,20 @@ func (s *store) interaction(ctx context.Context, id string) (*Interaction, error
 }
 
 func (s *store) interactions(ctx context.Context, course string, limit int) ([]*Interaction, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, course_id, user_id, kind, segment_id, offset_ms, text, status, answer_segment_id, verdict, created_at
-		FROM learn_interactions WHERE course_id=? ORDER BY created_at DESC LIMIT ?`, course, limit)
+	return s.interactionsWhere(ctx, course, "", limit)
+}
+
+// interactionsOn: past questions about any of these concepts, newest first.
+func (s *store) interactionsOn(ctx context.Context, course string, nodes []string, limit int) ([]*Interaction, error) {
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	return s.interactionsWhere(ctx, course, "AND node_id IN ("+quoteIDs(nodes)+")", limit)
+}
+
+func (s *store) interactionsWhere(ctx context.Context, course, where string, limit int) ([]*Interaction, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, course_id, user_id, kind, segment_id, offset_ms, text, status, answer_segment_id, verdict, created_at, node_id
+		FROM learn_interactions WHERE course_id=? `+where+` ORDER BY created_at DESC LIMIT ?`, course, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +663,7 @@ func (s *store) interactions(ctx context.Context, course string, limit int) ([]*
 	var out []*Interaction
 	for rows.Next() {
 		var i Interaction
-		if err := rows.Scan(&i.ID, &i.CourseID, &i.UserID, &i.Kind, &i.SegmentID, &i.OffsetMs, &i.Text, &i.Status, &i.AnswerSegmentID, &i.Verdict, &i.CreatedAt); err != nil {
+		if err := rows.Scan(&i.ID, &i.CourseID, &i.UserID, &i.Kind, &i.SegmentID, &i.OffsetMs, &i.Text, &i.Status, &i.AnswerSegmentID, &i.Verdict, &i.CreatedAt, &i.NodeID); err != nil {
 			return nil, err
 		}
 		out = append(out, &i)
@@ -609,28 +671,181 @@ func (s *store) interactions(ctx context.Context, course string, limit int) ([]*
 	return out, rows.Err()
 }
 
-func (s *store) finishInteraction(ctx context.Context, id, status, answerSeg, verdict string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE learn_interactions SET status=?, answer_segment_id=?, verdict=? WHERE id=?`, status, answerSeg, verdict, id)
+func (s *store) finishInteraction(ctx context.Context, id, status, answerSeg, verdict, node string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE learn_interactions SET status=?, answer_segment_id=?, verdict=?, node_id=CASE WHEN ?<>'' THEN ? ELSE node_id END WHERE id=?`,
+		status, answerSeg, verdict, node, node, id)
 	return err
+}
+
+// ---- notes: what the course has learned about the learner ----
+
+type Note struct {
+	ID        string `json:"id"`
+	CourseID  string `json:"-"`
+	NodeID    string `json:"node_id"`
+	Kind      string `json:"kind"` // misconception | gap | strength | interest | preference
+	Text      string `json:"text"`
+	Source    string `json:"source"`
+	Resolved  bool   `json:"resolved"`
+	CreatedAt string `json:"created_at"`
+}
+
+func (s *store) addNote(ctx context.Context, n *Note) error {
+	n.ID, n.CreatedAt = newID(), now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_notes (id, course_id, node_id, kind, text, source, resolved, created_at) VALUES (?,?,?,?,?,?,?,?)`,
+		n.ID, n.CourseID, n.NodeID, n.Kind, n.Text, n.Source, b2i(n.Resolved), n.CreatedAt)
+	return err
+}
+
+// notes: open notes for the course; with nodes, only those tagged to them (plus untagged ones).
+func (s *store) notes(ctx context.Context, course string, nodes []string, includeResolved bool, limit int) ([]*Note, error) {
+	q := `SELECT id, course_id, node_id, kind, text, source, resolved, created_at FROM learn_notes WHERE course_id=?`
+	if !includeResolved {
+		q += ` AND resolved=0`
+	}
+	if nodes != nil {
+		q += ` AND (node_id='' OR node_id IN (` + quoteIDs(nodes) + `))`
+	}
+	q += ` ORDER BY created_at DESC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, q, course, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Note
+	for rows.Next() {
+		var n Note
+		var res int
+		if err := rows.Scan(&n.ID, &n.CourseID, &n.NodeID, &n.Kind, &n.Text, &n.Source, &res, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		n.Resolved = res != 0
+		out = append(out, &n)
+	}
+	return out, rows.Err()
+}
+
+func (s *store) resolveNotes(ctx context.Context, course, node, kind string) {
+	_, _ = s.db.ExecContext(ctx, `UPDATE learn_notes SET resolved=1 WHERE course_id=? AND node_id=? AND kind=?`, course, node, kind)
+}
+
+func (s *store) setNote(ctx context.Context, course, id string, resolved, del bool) error {
+	if del {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM learn_notes WHERE course_id=? AND id=?`, course, id)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE learn_notes SET resolved=? WHERE course_id=? AND id=?`, b2i(resolved), course, id)
+	return err
+}
+
+// ---- quizzes ----
+
+type Quiz struct {
+	ID        string          `json:"id"`
+	CourseID  string          `json:"-"`
+	NodeID    string          `json:"node_id"`
+	Status    string          `json:"status"` // writing | ready | grading | done | failed
+	Questions json.RawMessage `json:"questions"`
+	Answers   json.RawMessage `json:"answers"`
+	Results   json.RawMessage `json:"results"`
+	Score     float64         `json:"score"`
+	Error     string          `json:"error"`
+	CreatedAt string          `json:"created_at"`
+}
+
+func (s *store) addQuiz(ctx context.Context, q *Quiz) error {
+	q.ID, q.CreatedAt = newID(), now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_quizzes (id, course_id, node_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?)`,
+		q.ID, q.CourseID, q.NodeID, q.Status, q.CreatedAt, q.CreatedAt)
+	return err
+}
+
+func (s *store) quiz(ctx context.Context, id string) (*Quiz, error) {
+	var q Quiz
+	var qs, as, rs string
+	err := s.db.QueryRowContext(ctx, `SELECT id, course_id, node_id, status, questions, answers, results, score, error, created_at FROM learn_quizzes WHERE id=?`, id).
+		Scan(&q.ID, &q.CourseID, &q.NodeID, &q.Status, &qs, &as, &rs, &q.Score, &q.Error, &q.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errNotFound
+	}
+	q.Questions, q.Answers, q.Results = json.RawMessage(qs), json.RawMessage(as), json.RawMessage(rs)
+	return &q, err
+}
+
+func (s *store) quizzes(ctx context.Context, course string, limit int) ([]*Quiz, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM learn_quizzes WHERE course_id=? ORDER BY created_at DESC LIMIT ?`, course, limit)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	var out []*Quiz
+	for _, id := range ids {
+		if q, err := s.quiz(ctx, id); err == nil {
+			out = append(out, q)
+		}
+	}
+	return out, nil
+}
+
+func (s *store) updateQuiz(ctx context.Context, q *Quiz) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE learn_quizzes SET status=?, questions=?, answers=?, results=?, score=?, error=?, updated_at=? WHERE id=?`,
+		q.Status, string(orEmpty(q.Questions)), string(orEmpty(q.Answers)), string(orEmpty(q.Results)), q.Score, q.Error, now(), q.ID)
+	return err
+}
+
+func orEmpty(b json.RawMessage) json.RawMessage {
+	if len(b) == 0 {
+		return json.RawMessage("[]")
+	}
+	return b
+}
+
+// quoteIDs renders hex ids for an IN list; ids are generated here (hex), never user text.
+func quoteIDs(ids []string) string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		ok := id != ""
+		for _, r := range id {
+			if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+				ok = false
+			}
+		}
+		if ok {
+			out = append(out, "'"+id+"'")
+		}
+	}
+	if len(out) == 0 {
+		return "''"
+	}
+	return strings.Join(out, ",")
 }
 
 // ---- playback ----
 
 func (s *store) playback(ctx context.Context, user, course string) (*Playback, error) {
 	var p Playback
-	err := s.db.QueryRowContext(ctx, `SELECT segment_id, offset_ms, rate, updated_at FROM learn_playback WHERE user_id=? AND course_id=?`, user, course).
-		Scan(&p.SegmentID, &p.OffsetMs, &p.Rate, &p.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT segment_id, offset_ms, rate, updated_at, device FROM learn_playback WHERE user_id=? AND course_id=?`, user, course).
+		Scan(&p.SegmentID, &p.OffsetMs, &p.Rate, &p.UpdatedAt, &p.Device)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, errNotFound
 	}
 	return &p, err
 }
 
-func (s *store) savePlayback(ctx context.Context, user, course string, p Playback) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_playback (user_id, course_id, segment_id, offset_ms, rate, updated_at) VALUES (?,?,?,?,?,?)
-		ON CONFLICT(user_id, course_id) DO UPDATE SET segment_id=excluded.segment_id, offset_ms=excluded.offset_ms, rate=excluded.rate, updated_at=excluded.updated_at`,
-		user, course, p.SegmentID, p.OffsetMs, p.Rate, now())
-	return err
+func (s *store) savePlayback(ctx context.Context, user, course string, p Playback) (string, error) {
+	at := now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learn_playback (user_id, course_id, segment_id, offset_ms, rate, updated_at, device) VALUES (?,?,?,?,?,?,?)
+		ON CONFLICT(user_id, course_id) DO UPDATE SET segment_id=excluded.segment_id, offset_ms=excluded.offset_ms, rate=excluded.rate,
+		updated_at=excluded.updated_at, device=excluded.device`,
+		user, course, p.SegmentID, p.OffsetMs, p.Rate, at, p.Device)
+	return at, err
 }
 
 // ownerPosition: the ord the owner is listening at (0 before the first segment).

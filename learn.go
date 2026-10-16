@@ -115,7 +115,7 @@ func (e *Engine) poke() {
 // Run starts the buffer controller and the workers; it returns when ctx ends.
 func (e *Engine) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	agentKinds := []string{"answer", "calibrate", "plan", "extend", "script"}
+	agentKinds := []string{"answer", "grade", "quiz", "calibrate", "plan", "extend", "script"}
 	for i := 0; i < e.opt.agentWorkers; i++ {
 		wg.Add(1)
 		go func() { defer wg.Done(); e.worker(ctx, agentKinds) }()
@@ -178,6 +178,10 @@ func (e *Engine) do(ctx context.Context, j *Job) error {
 		return e.doVoice(ctx, j)
 	case "answer":
 		return e.doAnswer(ctx, j)
+	case "quiz":
+		return e.doQuiz(ctx, j)
+	case "grade":
+		return e.doGrade(ctx, j)
 	}
 	return fmt.Errorf("unknown job kind %q", j.Kind)
 }
@@ -188,13 +192,26 @@ func (e *Engine) jobGaveUp(ctx context.Context, j *Job, err error) {
 	case "calibrate", "plan":
 		_ = e.st.updateCourse(ctx, j.CourseID, map[string]any{"status": StatusError, "error": err.Error()})
 	case "voice":
-		var p struct{ SegmentID string `json:"segment_id"` }
+		var p struct {
+			SegmentID string `json:"segment_id"`
+		}
 		_ = json.Unmarshal(j.Payload, &p)
 		_ = e.st.setSegmentStatus(ctx, p.SegmentID, SegFailed)
 	case "answer":
-		var p struct{ InteractionID string `json:"interaction_id"` }
+		var p struct {
+			InteractionID string `json:"interaction_id"`
+		}
 		_ = json.Unmarshal(j.Payload, &p)
-		_ = e.st.finishInteraction(ctx, p.InteractionID, "failed", "", "")
+		_ = e.st.finishInteraction(ctx, p.InteractionID, "failed", "", "", "")
+	case "quiz", "grade":
+		var p struct {
+			QuizID string `json:"quiz_id"`
+		}
+		_ = json.Unmarshal(j.Payload, &p)
+		if q, err2 := e.st.quiz(ctx, p.QuizID); err2 == nil {
+			q.Status, q.Error = "failed", err.Error()
+			_ = e.st.updateQuiz(ctx, q)
+		}
 	case "script", "extend":
 		_ = e.st.updateCourse(ctx, j.CourseID, map[string]any{"error": "generation is failing: " + err.Error()})
 	}
@@ -413,15 +430,27 @@ func (e *Engine) doExtend(ctx context.Context, j *Job) error {
 	return e.st.enqueue(ctx, c.ID, "script", 30, nil)
 }
 
-type scriptOut struct {
+type nextOut struct {
+	Move       string `json:"move"`
+	Focus      string `json:"focus"`
+	NewConcept struct {
+		Title      string `json:"title"`
+		Objectives string `json:"objectives"`
+		Module     string `json:"module"`
+	} `json:"new_concept"`
 	Title          string            `json:"title"`
 	Script         string            `json:"script"`
 	Summary        string            `json:"summary"`
-	ConceptDone    bool              `json:"concept_done"`
 	Checkin        string            `json:"checkin"`
 	Pronunciations map[string]string `json:"pronunciations"`
 }
 
+// sessionTurns: a course keeps one rolling teacher session, refreshed this often so it never bloats.
+const sessionTurns = 15
+
+// doScript decides and writes the next segment. Nothing is ever "finished": the teacher sees the whole
+// map (mastery, how often and how recently each idea came up) and what the learner has said, and
+// picks what to do next — continue, revisit from a new angle, go deeper, review, connect or branch out.
 func (e *Engine) doScript(ctx context.Context, j *Job) error {
 	c, err := e.st.course(ctx, j.CourseID)
 	if err != nil {
@@ -431,150 +460,188 @@ func (e *Engine) doScript(ctx context.Context, j *Job) error {
 	if err != nil {
 		return err
 	}
-	var concepts, modules []*Node
-	byID := map[string]*Node{}
+	x := nextContext{Steer: c.Steer}
 	for _, n := range nodes {
-		byID[n.ID] = n
 		if n.Kind == "concept" {
-			concepts = append(concepts, n)
+			x.Concepts = append(x.Concepts, n)
 		} else {
-			modules = append(modules, n)
+			x.Modules = append(x.Modules, n)
 		}
 	}
-	if len(concepts) == 0 {
-		return errors.New("no curriculum yet")
+	if len(x.Concepts) == 0 {
+		return errors.New("no map yet")
 	}
+	recent, _ := e.st.recentSegments(ctx, c.ID, 1e18, 10)
+	x.Recent = recent
+	asked, _ := e.st.interactions(ctx, c.ID, 6)
+	x.Asked = asked
 	last, err := e.st.lastSegment(ctx, c.ID)
 	if err != nil && !errors.Is(err, errNotFound) {
 		return err
-	}
-	// Where are we? The last lesson segment decides: continue its concept, or move to the next one.
-	var lastLesson *Segment
-	recentAll, _ := e.st.recentSegments(ctx, c.ID, 1e18, 40)
-	lessonsInConcept, sinceCheckin := 0, 0
-	for k := len(recentAll) - 1; k >= 0; k-- {
-		if recentAll[k].Kind == "lesson" {
-			lastLesson = recentAll[k]
-			break
-		}
-	}
-	x := segmentContext{}
-	idx := 0
-	if lastLesson == nil {
-		x.Concept, x.NewConcept = concepts[0], true
-	} else {
-		for k, n := range concepts {
-			if n.ID == lastLesson.NodeID {
-				idx = k
-			}
-		}
-		for _, g := range recentAll {
-			if g.Kind == "lesson" && g.NodeID == lastLesson.NodeID {
-				lessonsInConcept++
-			}
-		}
-		if lastLesson.ConceptDone || lessonsInConcept >= 8 {
-			idx++
-			x.NewConcept = true
-		}
-		if idx >= len(concepts) {
-			return e.st.enqueue(ctx, c.ID, "extend", 30, nil)
-		}
-		x.Concept = concepts[idx]
-	}
-	for k, n := range concepts {
-		if n.ID == x.Concept.ID {
-			idx = k
-		}
-	}
-	if idx+1 < len(concepts) {
-		x.NextConceptTitle = concepts[idx+1].Title
-	}
-	x.Module = byID[x.Concept.ParentID]
-	if x.Module == nil {
-		return errors.New("concept has no module")
-	}
-	for k, m := range modules {
-		if m.ID == x.Module.ID {
-			x.ModuleIndex = k + 1
-		}
-	}
-	x.Of = len(modules)
-	var inModule []*Node
-	for _, n := range concepts {
-		if n.ParentID == x.Module.ID {
-			inModule = append(inModule, n)
-		}
-	}
-	for k, n := range inModule {
-		if n.ID == x.Concept.ID {
-			x.ConceptIndex = k + 1
-		}
-	}
-	x.OfCon = len(inModule)
-	for k := len(recentAll) - 1; k >= 0; k-- {
-		if recentAll[k].Checkin != "" {
-			break
-		}
-		if recentAll[k].Kind == "lesson" {
-			sinceCheckin++
-		}
-	}
-	x.CheckinDue = sinceCheckin >= 4
-	if n := len(recentAll); n > 8 {
-		x.Recent = recentAll[n-8:]
-	} else {
-		x.Recent = recentAll
 	}
 	ord := 1.0
 	if last != nil {
 		ord = float64(int(last.Ord)) + 1
 	}
-	// Spaced review: every sixth segment, call back to weak finished concepts.
-	if int(ord)%6 == 5 {
-		var weak []*Node
-		for _, n := range concepts[:idx] {
-			if n.Status == "done" && n.Mastery < 0.8 {
-				weak = append(weak, n)
+	x.SegmentsSoFar = int(ord) - 1
+
+	// Default suggestion: stay with the current idea for a few segments, then the least-covered idea in map order.
+	var lastLesson *Segment
+	for k := len(recent) - 1; k >= 0; k-- {
+		if recent[k].Kind == "lesson" {
+			lastLesson = recent[k]
+			break
+		}
+	}
+	run := 0
+	for k := len(recent) - 1; k >= 0 && lastLesson != nil; k-- {
+		if recent[k].Kind == "lesson" {
+			if recent[k].NodeID != lastLesson.NodeID {
+				break
+			}
+			run++
+		}
+	}
+	if lastLesson != nil && run < 3 {
+		for _, n := range x.Concepts {
+			if n.ID == lastLesson.NodeID {
+				x.Suggestion = n
 			}
 		}
-		sort.Slice(weak, func(a, b int) bool { return weak[a].Mastery < weak[b].Mastery })
-		if len(weak) > 2 {
-			weak = weak[:2]
-		}
-		x.Reviews = weak
 	}
+	if x.Suggestion == nil {
+		for _, n := range x.Concepts {
+			if x.Suggestion == nil || n.Covered < x.Suggestion.Covered {
+				x.Suggestion = n
+			}
+		}
+	}
+	sinceCheckin := 0
+	for k := len(recent) - 1; k >= 0; k-- {
+		if recent[k].Checkin != "" {
+			break
+		}
+		if recent[k].Kind == "lesson" {
+			sinceCheckin++
+		}
+	}
+	x.CheckinDue = sinceCheckin >= 4
 
-	var out scriptOut
-	res, err := e.turn(ctx, c, "learn-"+c.ID+"-m"+x.Module.ID, x.Module.SessionProv, x.Module.SessionID,
-		func(resumed bool) string { return scriptPrompt(c, x, resumed) }, &out)
+	// Only what's relevant goes into the turn: the ideas likely in play, and notes and past questions on them.
+	cands := []*Node{x.Suggestion}
+	if lastLesson != nil {
+		for _, n := range x.Concepts {
+			if n.ID == lastLesson.NodeID {
+				cands = append(cands, n)
+			}
+		}
+	}
+	cands = append(cands, mentioned(x.Concepts, c.Steer)...)
+	cands = append(cands, weakest(x.Concepts, 3)...)
+	e.workingSet(ctx, c, &x, cands)
+
+	session := c.SessionID
+	if c.SessionN >= sessionTurns {
+		session = "" // refresh: a new session gets the full brief, map and recent history
+	}
+	var out nextOut
+	res, err := e.turn(ctx, c, "learn-"+c.ID, c.SessionProv, session, func(resumed bool) string { return nextPrompt(c, x, resumed) }, &out)
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(out.Script) == "" {
 		return errors.New("empty script")
 	}
-	if res.SessionID != "" && (res.SessionID != x.Module.SessionID || res.Provider != x.Module.SessionProv) {
-		x.Module.SessionID, x.Module.SessionProv = res.SessionID, res.Provider
-		_ = e.st.updateNode(ctx, x.Module)
+
+	// Where on the map is this? An existing concept, or a new one the teacher branched into.
+	var focus *Node
+	for _, n := range x.Concepts {
+		if strings.EqualFold(strings.TrimSpace(n.Title), strings.TrimSpace(out.Focus)) {
+			focus = n
+		}
 	}
+	if focus == nil && strings.TrimSpace(out.NewConcept.Title) != "" {
+		focus, err = e.addConcept(ctx, c, x.Modules, x.Concepts, out.NewConcept.Title, out.NewConcept.Objectives, out.NewConcept.Module)
+		if err != nil {
+			return err
+		}
+	}
+	if focus == nil {
+		focus = x.Suggestion
+	}
+	focus.Covered++
+	focus.LastCoveredAt = now()
+	if focus.Status == "pending" {
+		focus.Status = "active"
+	}
+	_ = e.st.updateNode(ctx, focus)
+
 	g := &Segment{
-		CourseID: c.ID, Ord: ord, Kind: "lesson", NodeID: x.Concept.ID, Title: out.Title, Script: cleanScript(out.Script),
-		Summary: out.Summary, Checkin: strings.TrimSpace(out.Checkin), ConceptDone: out.ConceptDone, Status: SegScripted, LLM: llmLabel(res),
+		CourseID: c.ID, Ord: ord, Kind: "lesson", NodeID: focus.ID, Title: out.Title, Script: cleanScript(out.Script),
+		Summary: out.Summary, Checkin: strings.TrimSpace(out.Checkin), Status: SegScripted, LLM: llmLabel(res),
 	}
 	g.Speech = applyPronunciations(g.Script, out.Pronunciations)
 	if err := e.st.insertSegment(ctx, g); err != nil {
 		return err
 	}
-	if x.Concept.Status == "pending" || out.ConceptDone {
-		x.Concept.Status = "active"
-		if out.ConceptDone {
-			x.Concept.Status = "done"
+	set := map[string]any{"error": "", "steer": ""}
+	if res.SessionID != "" && res.Provider == c.Provider {
+		if res.SessionID != c.SessionID || session == "" {
+			set["session_id"], set["session_provider"], set["session_turns"] = res.SessionID, res.Provider, 1
+		} else {
+			set["session_turns"] = c.SessionN + 1
 		}
-		_ = e.st.updateNode(ctx, x.Concept)
+	} else {
+		set["session_id"], set["session_turns"] = "", 0 // a failover turn: start fresh next time
 	}
-	_ = e.st.updateCourse(ctx, c.ID, map[string]any{"error": ""})
+	_ = e.st.updateCourse(ctx, c.ID, set)
+
+	// Keep the map growing ahead of the learner, so there's always somewhere new to go.
+	fresh := 0
+	for _, n := range x.Concepts {
+		if n.Covered == 0 {
+			fresh++
+		}
+	}
+	if fresh < 4 && !e.st.hasJob(ctx, c.ID, "extend") {
+		_ = e.st.enqueue(ctx, c.ID, "extend", 20, nil)
+	}
 	return e.st.enqueue(ctx, c.ID, "voice", 40, map[string]string{"segment_id": g.ID})
+}
+
+// addConcept puts a concept the teacher branched into on the map, under a module with that title
+// (made if needed).
+func (e *Engine) addConcept(ctx context.Context, c *Course, modules, concepts []*Node, title, objectives, module string) (*Node, error) {
+	var mod *Node
+	for _, m := range modules {
+		if strings.EqualFold(strings.TrimSpace(m.Title), strings.TrimSpace(module)) {
+			mod = m
+		}
+	}
+	maxOrd := 0.0
+	for _, n := range append(append([]*Node{}, modules...), concepts...) {
+		if n.Ord > maxOrd {
+			maxOrd = n.Ord
+		}
+	}
+	if mod == nil {
+		if strings.TrimSpace(module) == "" {
+			module = "Further afield"
+		}
+		mod = &Node{CourseID: c.ID, Kind: "module", Ord: (float64(int(maxOrd/100)) + 1) * 100, Title: module}
+		if err := e.st.insertNode(ctx, mod); err != nil {
+			return nil, err
+		}
+		maxOrd = mod.Ord
+	}
+	last := mod.Ord
+	for _, n := range concepts {
+		if n.ParentID == mod.ID && n.Ord > last {
+			last = n.Ord
+		}
+	}
+	n := &Node{CourseID: c.ID, ParentID: mod.ID, Kind: "concept", Ord: last + 0.5, Title: strings.TrimSpace(title), Summary: objectives}
+	return n, e.st.insertNode(ctx, n)
 }
 
 func (e *Engine) doVoice(ctx context.Context, j *Job) error {
@@ -631,17 +698,156 @@ func (e *Engine) doVoice(ctx context.Context, j *Job) error {
 	return e.st.updateSegment(ctx, g)
 }
 
+type noteOut struct {
+	Concept string `json:"concept"`
+	Kind    string `json:"kind"`
+	Text    string `json:"text"`
+}
+
 type answerOut struct {
 	Title          string             `json:"title"`
 	Script         string             `json:"script"`
 	Summary        string             `json:"summary"`
 	Verdict        string             `json:"verdict"`
 	Replan         string             `json:"replan"`
+	About          string             `json:"about"`
 	Profile        json.RawMessage    `json:"profile"`
 	Mastery        map[string]float64 `json:"mastery"`
+	Notes          []noteOut          `json:"notes"`
 	Known          []string           `json:"known"`
 	NextConcept    string             `json:"next_concept"`
 	Pronunciations map[string]string  `json:"pronunciations"`
+}
+
+// loadMap reads a course's modules and concepts.
+func (e *Engine) loadMap(ctx context.Context, c *Course) (x nextContext, err error) {
+	nodes, err := e.st.nodes(ctx, c.ID)
+	if err != nil {
+		return x, err
+	}
+	for _, n := range nodes {
+		if n.Kind == "concept" {
+			x.Concepts = append(x.Concepts, n)
+		} else {
+			x.Modules = append(x.Modules, n)
+		}
+	}
+	return x, nil
+}
+
+// workingSet fills in what's relevant to a turn about the candidate concepts: which ideas get full detail
+// in the map, the notes tagged to them (plus a few recent general ones) and the learner's older
+// questions about them. This is what keeps a turn small however long the course runs.
+func (e *Engine) workingSet(ctx context.Context, c *Course, x *nextContext, cands []*Node) {
+	x.InPlay = map[string]bool{}
+	var ids []string
+	for _, n := range cands {
+		if n != nil && !x.InPlay[n.ID] {
+			x.InPlay[n.ID] = true
+			ids = append(ids, n.ID)
+		}
+	}
+	x.Notes, _ = e.st.notes(ctx, c.ID, ids, false, 15)
+	past, _ := e.st.interactionsOn(ctx, c.ID, ids, 8)
+	seen := map[string]bool{}
+	for _, i := range x.Asked {
+		seen[i.ID] = true
+	}
+	for _, i := range past {
+		if !seen[i.ID] && len(x.Past) < 5 {
+			x.Past = append(x.Past, i)
+		}
+	}
+}
+
+// mentioned: concepts whose title appears in the text (for steering and questions).
+func mentioned(concepts []*Node, text string) []*Node {
+	t := strings.ToLower(text)
+	if strings.TrimSpace(t) == "" {
+		return nil
+	}
+	var out []*Node
+	for _, n := range concepts {
+		title := strings.ToLower(strings.TrimSpace(n.Title))
+		if title != "" && (strings.Contains(t, title) || strings.Contains(title, strings.TrimSpace(t))) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// weakest: covered concepts with the lowest mastery.
+func weakest(concepts []*Node, k int) []*Node {
+	var cov []*Node
+	for _, n := range concepts {
+		if n.Covered > 0 {
+			cov = append(cov, n)
+		}
+	}
+	sort.Slice(cov, func(a, b int) bool { return cov[a].Mastery < cov[b].Mastery })
+	if len(cov) > k {
+		cov = cov[:k]
+	}
+	return cov
+}
+
+func byTitle(concepts []*Node, title string) *Node {
+	for _, n := range concepts {
+		if strings.EqualFold(strings.TrimSpace(n.Title), strings.TrimSpace(title)) {
+			return n
+		}
+	}
+	return nil
+}
+
+// saveNotes keeps what a turn learned about the learner, tagged to concepts.
+func (e *Engine) saveNotes(ctx context.Context, c *Course, concepts []*Node, notes []noteOut, source string) {
+	for _, n := range notes {
+		text := strings.TrimSpace(n.Text)
+		kind := strings.ToLower(strings.TrimSpace(n.Kind))
+		switch kind {
+		case "misconception", "gap", "strength", "interest", "preference":
+		default:
+			kind = "note"
+		}
+		if text == "" {
+			continue
+		}
+		node := ""
+		if c := byTitle(concepts, n.Concept); c != nil {
+			node = c.ID
+		}
+		_ = e.st.addNote(ctx, &Note{CourseID: c.ID, NodeID: node, Kind: kind, Text: text, Source: source})
+	}
+}
+
+// recordRecall applies one retrieval attempt (check-in or quiz) to a concept. Mastered means two correct
+// recalls more than a day apart; getting it right clears its open misconceptions.
+func (e *Engine) recordRecall(ctx context.Context, c *Course, n *Node, verdict string) {
+	if n == nil {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(verdict)) {
+	case "correct":
+		prev, perr := time.Parse(time.RFC3339Nano, n.LastRecallAt)
+		if n.CorrectRecalls == 0 || perr != nil || time.Since(prev) > 24*time.Hour {
+			n.CorrectRecalls++
+		}
+		n.LastRecallAt = now()
+		n.Mastery = clamp01(n.Mastery + 0.1)
+		if n.CorrectRecalls >= 2 && n.Mastery < 0.9 {
+			n.Mastery = 0.9
+		}
+		e.st.resolveNotes(ctx, c.ID, n.ID, "misconception")
+	case "partial":
+		n.Mastery = clamp01(n.Mastery + 0.03)
+	case "wrong":
+		n.CorrectRecalls = 0
+		if n.Mastery > 0.4 {
+			n.Mastery = 0.4
+		}
+	}
+	_ = e.st.updateNode(ctx, n)
 }
 
 func (e *Engine) doAnswer(ctx context.Context, j *Job) error {
@@ -672,9 +878,23 @@ func (e *Engine) doAnswer(ctx context.Context, j *Job) error {
 		recent = recent[:len(recent)-1]
 	}
 	upcoming, _ := e.st.segmentsAfter(ctx, c.ID, at, 4)
-	curriculum, _ := e.st.nodes(ctx, c.ID)
+	x, err := e.loadMap(ctx, c)
+	if err != nil {
+		return err
+	}
+	var cands []*Node
+	if current != nil {
+		for _, n := range x.Concepts {
+			if n.ID == current.NodeID {
+				cands = append(cands, n)
+			}
+		}
+	}
+	cands = append(cands, mentioned(x.Concepts, i.Text)...)
+	e.workingSet(ctx, c, &x, cands)
+
 	var out answerOut
-	res, err := e.turn(ctx, c, "learn-"+c.ID+"-ask", "", "", func(bool) string { return answerPrompt(c, i, current, recent, upcoming, curriculum, false) }, &out)
+	res, err := e.turn(ctx, c, "learn-"+c.ID+"-ask", "", "", func(bool) string { return answerPrompt(c, i, current, recent, upcoming, x, false) }, &out)
 	if err != nil {
 		return err
 	}
@@ -701,9 +921,17 @@ func (e *Engine) doAnswer(ctx context.Context, j *Job) error {
 	if i.Kind == "checkin" {
 		kind = "feedback"
 	}
+	about := byTitle(x.Concepts, out.About)
+	if about == nil && current != nil {
+		for _, n := range x.Concepts {
+			if n.ID == current.NodeID {
+				about = n
+			}
+		}
+	}
 	node := ""
-	if current != nil {
-		node = current.NodeID
+	if about != nil {
+		node = about.ID
 	}
 	g := &Segment{CourseID: c.ID, Ord: ord, Kind: kind, NodeID: node, Title: out.Title, Script: cleanScript(out.Script), Summary: out.Summary,
 		Status: SegScripted, LLM: llmLabel(res), InteractionID: i.ID}
@@ -718,92 +946,272 @@ func (e *Engine) doAnswer(ctx context.Context, j *Job) error {
 		n, _ := e.st.discardAfter(ctx, c.ID, g.Ord, g.ID)
 		e.log.Info().Str("course", c.ID).Int64("discarded", n).Msg("replanning after the learner's input")
 	}
-	e.learnFrom(ctx, c, current, out, i)
-	return e.st.finishInteraction(ctx, i.ID, "answered", g.ID, strings.ToLower(strings.TrimSpace(out.Verdict)))
-}
 
-// learnFrom updates the profile and mastery from an answer turn. A concept counts as mastered only
-// after two correct recalls more than a day apart.
-func (e *Engine) learnFrom(ctx context.Context, c *Course, current *Segment, out answerOut, i *Interaction) {
+	// Learn from it.
 	if len(out.Profile) > 2 && json.Valid(out.Profile) {
 		_ = e.st.updateCourse(ctx, c.ID, map[string]any{"profile": []byte(out.Profile)})
 	}
-	nodes, _ := e.st.nodes(ctx, c.ID)
 	for title, m := range out.Mastery {
-		for _, n := range nodes {
-			if n.Kind == "concept" && strings.EqualFold(strings.TrimSpace(n.Title), strings.TrimSpace(title)) {
-				n.Mastery = clamp01(m)
-				_ = e.st.updateNode(ctx, n)
-			}
-		}
-	}
-	// Steering the curriculum: skip what they know, pull forward what they asked for.
-	find := func(title string) *Node {
-		for _, n := range nodes {
-			if n.Kind == "concept" && strings.EqualFold(strings.TrimSpace(n.Title), strings.TrimSpace(title)) {
-				return n
-			}
-		}
-		return nil
-	}
-	var cur *Node
-	if current != nil {
-		for _, n := range nodes {
-			if n.ID == current.NodeID {
-				cur = n
-			}
+		if n := byTitle(x.Concepts, title); n != nil {
+			n.Mastery = clamp01(m)
+			_ = e.st.updateNode(ctx, n)
 		}
 	}
 	for _, t := range out.Known {
-		if n := find(t); n != nil && n.Status != "done" {
-			n.Status = "done"
-			if n.Mastery < 0.8 {
-				n.Mastery = 0.8
-			}
+		if n := byTitle(x.Concepts, t); n != nil && n.Mastery < 0.8 {
+			n.Mastery = 0.8
 			_ = e.st.updateNode(ctx, n)
-			if cur != nil && n.ID == cur.ID {
-				e.markConceptDone(ctx, current)
-			}
 		}
 	}
-	if n := find(out.NextConcept); n != nil && cur != nil && n.ID != cur.ID && n.Status != "done" {
-		// Teach it next: move it just after the current concept and close the current one.
-		_, _ = e.st.db.ExecContext(ctx, `UPDATE learn_nodes SET ord=? WHERE id=?`, cur.Ord+0.01, n.ID)
-		e.markConceptDone(ctx, current)
-		e.log.Info().Str("course", c.ID).Str("concept", n.Title).Msg("pulled a concept forward")
+	e.saveNotes(ctx, c, x.Concepts, out.Notes, i.Kind)
+	if next := strings.TrimSpace(out.NextConcept); next != "" {
+		_ = e.st.updateCourse(ctx, c.ID, map[string]any{"steer": next})
+	} else if i.Kind == "ask" && strings.EqualFold(out.Replan, "regenerate") {
+		_ = e.st.updateCourse(ctx, c.ID, map[string]any{"steer": "follow up on what they just asked: " + i.Text})
 	}
-	if i.Kind != "checkin" || current == nil {
-		return
-	}
-	n, err := e.st.node(ctx, current.NodeID)
-	if err != nil {
-		return
-	}
-	switch strings.ToLower(strings.TrimSpace(out.Verdict)) {
-	case "correct":
-		prev, perr := time.Parse(time.RFC3339Nano, n.LastRecallAt)
-		if n.CorrectRecalls == 0 || perr != nil || time.Since(prev) > 24*time.Hour {
-			n.CorrectRecalls++
-		}
-		n.LastRecallAt = now()
-		if n.CorrectRecalls >= 2 && n.Mastery < 0.9 {
-			n.Mastery = 0.9
-		}
-	case "wrong":
-		n.CorrectRecalls = 0
-		if n.Mastery > 0.4 {
-			n.Mastery = 0.4
+	if i.Kind == "checkin" && current != nil {
+		if n, err := e.st.node(ctx, current.NodeID); err == nil {
+			e.recordRecall(ctx, c, n, out.Verdict)
 		}
 	}
-	_ = e.st.updateNode(ctx, n)
+	return e.st.finishInteraction(ctx, i.ID, "answered", g.ID, strings.ToLower(strings.TrimSpace(out.Verdict)), node)
 }
 
-// markConceptDone makes the next script move on from the concept the learner was in.
-func (e *Engine) markConceptDone(ctx context.Context, current *Segment) {
-	if current == nil {
-		return
+// ---- quizzes ----
+
+type quizQuestion struct {
+	Type        string   `json:"type"` // mc | short
+	Concept     string   `json:"concept"`
+	NodeID      string   `json:"node_id"`
+	Q           string   `json:"q"`
+	Options     []string `json:"options,omitempty"`
+	Answer      int      `json:"answer"`
+	Explain     string   `json:"explain,omitempty"`
+	ModelAnswer string   `json:"model_answer,omitempty"`
+	Rubric      string   `json:"rubric,omitempty"`
+}
+
+type quizResult struct {
+	I        int    `json:"i"`
+	Verdict  string `json:"verdict"`
+	Feedback string `json:"feedback"`
+}
+
+func (e *Engine) doQuiz(ctx context.Context, j *Job) error {
+	var p struct {
+		QuizID string `json:"quiz_id"`
 	}
-	_, _ = e.st.db.ExecContext(ctx, `UPDATE learn_segments SET concept_done=1 WHERE course_id=? AND node_id=? AND kind='lesson'`, current.CourseID, current.NodeID)
+	if err := json.Unmarshal(j.Payload, &p); err != nil {
+		return err
+	}
+	q, err := e.st.quiz(ctx, p.QuizID)
+	if err != nil {
+		return err
+	}
+	c, err := e.st.course(ctx, q.CourseID)
+	if err != nil {
+		return err
+	}
+	x, err := e.loadMap(ctx, c)
+	if err != nil {
+		return err
+	}
+	var focus *Node
+	cands := weakest(x.Concepts, 4)
+	for _, n := range x.Concepts {
+		if n.ID == q.NodeID {
+			focus = n
+			cands = append([]*Node{n}, cands...)
+		}
+	}
+	e.workingSet(ctx, c, &x, cands)
+	recent, _ := e.st.recentSegments(ctx, c.ID, 1e18, 15)
+	var out struct {
+		Questions []quizQuestion `json:"questions"`
+	}
+	if _, err := e.turn(ctx, c, "learn-"+c.ID+"-quiz", "", "", func(bool) string { return quizPrompt(c, x, recent, focus) }, &out); err != nil {
+		return err
+	}
+	var qs []quizQuestion
+	for _, qq := range out.Questions {
+		qq.Type = strings.ToLower(qq.Type)
+		if strings.TrimSpace(qq.Q) == "" || (qq.Type == "mc" && (len(qq.Options) < 2 || qq.Answer < 0 || qq.Answer >= len(qq.Options))) {
+			continue
+		}
+		if qq.Type != "mc" {
+			qq.Type = "short"
+		}
+		if n := byTitle(x.Concepts, qq.Concept); n != nil {
+			qq.NodeID = n.ID
+		}
+		qs = append(qs, qq)
+	}
+	if len(qs) == 0 {
+		return errors.New("the quiz came back empty")
+	}
+	q.Questions, _ = json.Marshal(qs)
+	q.Status = "ready"
+	return e.st.updateQuiz(ctx, q)
+}
+
+// submitQuiz marks multiple-choice answers at once and sends short answers for grading.
+func (e *Engine) submitQuiz(ctx context.Context, c *Course, q *Quiz, answers []json.RawMessage) error {
+	var qs []quizQuestion
+	if err := json.Unmarshal(q.Questions, &qs); err != nil {
+		return err
+	}
+	results := make([]quizResult, len(qs))
+	needGrading := false
+	nodes, _ := e.st.nodes(ctx, c.ID)
+	byID := map[string]*Node{}
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	for k, qq := range qs {
+		results[k] = quizResult{I: k}
+		var raw json.RawMessage
+		if k < len(answers) {
+			raw = answers[k]
+		}
+		if qq.Type == "mc" {
+			var pick int = -1
+			_ = json.Unmarshal(raw, &pick)
+			results[k].Verdict = "wrong"
+			if pick == qq.Answer {
+				results[k].Verdict = "correct"
+			}
+			results[k].Feedback = qq.Explain
+			e.recordRecall(ctx, c, byID[qq.NodeID], results[k].Verdict)
+		} else {
+			needGrading = true
+			results[k].Verdict = "pending"
+		}
+	}
+	q.Answers, _ = json.Marshal(answers)
+	q.Results, _ = json.Marshal(results)
+	q.Score = quizScore(results)
+	q.Status = "done"
+	if needGrading {
+		q.Status = "grading"
+	}
+	if err := e.st.updateQuiz(ctx, q); err != nil {
+		return err
+	}
+	if needGrading {
+		return e.st.enqueue(ctx, c.ID, "grade", 85, map[string]string{"quiz_id": q.ID})
+	}
+	return nil
+}
+
+func quizScore(rs []quizResult) float64 {
+	if len(rs) == 0 {
+		return 0
+	}
+	t := 0.0
+	for _, r := range rs {
+		switch r.Verdict {
+		case "correct":
+			t++
+		case "partial":
+			t += 0.5
+		}
+	}
+	return t / float64(len(rs))
+}
+
+func (e *Engine) doGrade(ctx context.Context, j *Job) error {
+	var p struct {
+		QuizID string `json:"quiz_id"`
+	}
+	if err := json.Unmarshal(j.Payload, &p); err != nil {
+		return err
+	}
+	q, err := e.st.quiz(ctx, p.QuizID)
+	if err != nil {
+		return err
+	}
+	if q.Status != "grading" {
+		return nil
+	}
+	c, err := e.st.course(ctx, q.CourseID)
+	if err != nil {
+		return err
+	}
+	var qs []quizQuestion
+	var answers []json.RawMessage
+	var results []quizResult
+	_ = json.Unmarshal(q.Questions, &qs)
+	_ = json.Unmarshal(q.Answers, &answers)
+	_ = json.Unmarshal(q.Results, &results)
+	var items strings.Builder
+	for k, qq := range qs {
+		if qq.Type != "short" {
+			continue
+		}
+		var a string
+		if k < len(answers) {
+			_ = json.Unmarshal(answers[k], &a)
+		}
+		fmt.Fprintf(&items, "Question i=%d (concept: %s): %s\nModel answer: %s\nMust contain: %s\nLearner's answer: %q\n\n", k, qq.Concept, qq.Q, qq.ModelAnswer, qq.Rubric, a)
+	}
+	var out struct {
+		Results []quizResult `json:"results"`
+		Notes   []noteOut    `json:"notes"`
+	}
+	if _, err := e.turn(ctx, c, "learn-"+c.ID+"-grade", "", "", func(bool) string { return gradePrompt(c, items.String()) }, &out); err != nil {
+		return err
+	}
+	nodes, _ := e.st.nodes(ctx, c.ID)
+	byID := map[string]*Node{}
+	var concepts []*Node
+	for _, n := range nodes {
+		byID[n.ID] = n
+		if n.Kind == "concept" {
+			concepts = append(concepts, n)
+		}
+	}
+	// Match each grade to its question: by index when the grader used ours, else by order among the
+	// short-answer questions (graders often renumber from 0 or 1).
+	var short []int
+	isShort := map[int]bool{}
+	for k, qq := range qs {
+		if qq.Type == "short" {
+			short = append(short, k)
+			isShort[k] = true
+		}
+	}
+	byIndex := true
+	for _, r := range out.Results {
+		byIndex = byIndex && isShort[r.I]
+	}
+	for pos, r := range out.Results {
+		k := r.I
+		if !byIndex {
+			if pos >= len(short) {
+				break
+			}
+			k = short[pos]
+		}
+		if k < 0 || k >= len(results) || !isShort[k] {
+			continue
+		}
+		v := strings.ToLower(strings.TrimSpace(r.Verdict))
+		if v != "correct" && v != "partial" {
+			v = "wrong"
+		}
+		results[k] = quizResult{I: k, Verdict: v, Feedback: r.Feedback}
+		e.recordRecall(ctx, c, byID[qs[k].NodeID], v)
+	}
+	for k := range results {
+		if results[k].Verdict == "pending" {
+			results[k].Verdict, results[k].Feedback = "partial", "Couldn't be graded automatically."
+		}
+	}
+	e.saveNotes(ctx, c, concepts, out.Notes, "quiz")
+	q.Results, _ = json.Marshal(results)
+	q.Score = quizScore(results)
+	q.Status = "done"
+	return e.st.updateQuiz(ctx, q)
 }
 
 // ---- text helpers ----

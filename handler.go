@@ -51,10 +51,18 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("GET /api/courses/{id}/segments/{sid}", e.course(false, e.getSegment))
 	mux.HandleFunc("GET /api/courses/{id}/audio/{sid}", e.course(false, e.audio))
 	mux.HandleFunc("PUT /api/courses/{id}/playback", e.course(false, e.putPlayback))
+	mux.HandleFunc("GET /api/courses/{id}/playback", e.course(false, e.getPlayback))
 	mux.HandleFunc("POST /api/courses/{id}/ask", e.course(true, e.ask))
 	mux.HandleFunc("POST /api/courses/{id}/transcribe", e.course(true, e.transcribe))
 	mux.HandleFunc("GET /api/courses/{id}/interactions", e.course(false, e.listInteractions))
 	mux.HandleFunc("POST /api/courses/{id}/members", e.course(true, e.setMember))
+	mux.HandleFunc("POST /api/courses/{id}/focus", e.course(true, e.setFocus))
+	mux.HandleFunc("GET /api/courses/{id}/notes", e.course(true, e.listNotes))
+	mux.HandleFunc("PATCH /api/courses/{id}/notes/{nid}", e.course(true, e.patchNote))
+	mux.HandleFunc("GET /api/courses/{id}/quizzes", e.course(true, e.listQuizzes))
+	mux.HandleFunc("POST /api/courses/{id}/quizzes", e.course(true, e.newQuiz))
+	mux.HandleFunc("GET /api/courses/{id}/quizzes/{qid}", e.course(true, e.getQuiz))
+	mux.HandleFunc("POST /api/courses/{id}/quizzes/{qid}/answers", e.course(true, e.answerQuiz))
 	return mux
 }
 
@@ -101,9 +109,9 @@ func (e *Engine) course(steer bool, h http.HandlerFunc) http.HandlerFunc {
 	})
 }
 
-func user(r *http.Request) string        { s, _ := r.Context().Value(userKey).(string); return s }
-func courseOf(r *http.Request) *Course   { c, _ := r.Context().Value(courseKey).(*Course); return c }
-func canSteer(r *http.Request) bool      { b, _ := r.Context().Value(steerKey).(bool); return b }
+func user(r *http.Request) string         { s, _ := r.Context().Value(userKey).(string); return s }
+func courseOf(r *http.Request) *Course    { c, _ := r.Context().Value(courseKey).(*Course); return c }
+func canSteer(r *http.Request) bool       { b, _ := r.Context().Value(steerKey).(bool); return b }
 func jsonOK(w http.ResponseWriter, v any) { writeJSON(w, http.StatusOK, v) }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -113,7 +121,9 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func jsonErr(w http.ResponseWriter, code int, msg string) { writeJSON(w, code, map[string]string{"error": msg}) }
+func jsonErr(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
 
 func decode(r *http.Request, v any) error {
 	return json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(v)
@@ -452,6 +462,7 @@ func (e *Engine) putPlayback(w http.ResponseWriter, r *http.Request) {
 		OffsetMs  int64   `json:"offset_ms"`
 		Rate      float64 `json:"rate"`
 		Finished  string  `json:"finished"` // a segment that just played to the end
+		Device    string  `json:"device"`   // which phone, tablet or laptop, for handoff
 	}
 	if err := decode(r, &in); err != nil {
 		jsonErr(w, http.StatusBadRequest, err.Error())
@@ -466,7 +477,11 @@ func (e *Engine) putPlayback(w http.ResponseWriter, r *http.Request) {
 	if in.Rate <= 0 {
 		in.Rate = 1
 	}
-	if err := e.st.savePlayback(ctx, user(r), c.ID, Playback{SegmentID: g.ID, OffsetMs: in.OffsetMs, Rate: in.Rate}); err != nil {
+	if len(in.Device) > 80 {
+		in.Device = in.Device[:80]
+	}
+	at, err := e.st.savePlayback(ctx, user(r), c.ID, Playback{SegmentID: g.ID, OffsetMs: in.OffsetMs, Rate: in.Rate, Device: in.Device})
+	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -479,7 +494,17 @@ func (e *Engine) putPlayback(w http.ResponseWriter, r *http.Request) {
 	if canSteer(r) {
 		e.poke()
 	}
-	jsonOK(w, map[string]bool{"ok": true})
+	jsonOK(w, map[string]any{"ok": true, "updated_at": at})
+}
+
+// getPlayback: where this user is in the course, and on which device, so another device can pick up.
+func (e *Engine) getPlayback(w http.ResponseWriter, r *http.Request) {
+	pb, err := e.st.playback(r.Context(), user(r), courseOf(r).ID)
+	if err != nil {
+		jsonOK(w, nil)
+		return
+	}
+	jsonOK(w, pb)
 }
 
 func (e *Engine) ask(w http.ResponseWriter, r *http.Request) {
@@ -566,7 +591,11 @@ func (e *Engine) transcribe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) listInteractions(w http.ResponseWriter, r *http.Request) {
-	is, err := e.st.interactions(r.Context(), courseOf(r).ID, 50)
+	limit := 50
+	if r.URL.Query().Get("all") != "" {
+		limit = 1000
+	}
+	is, err := e.st.interactions(r.Context(), courseOf(r).ID, limit)
 	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -599,3 +628,142 @@ func (e *Engine) setMember(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]any{"members": ms})
 }
 
+// setFocus: "teach this next" from the mind map.
+func (e *Engine) setFocus(w http.ResponseWriter, r *http.Request) {
+	c := courseOf(r)
+	var in struct {
+		NodeID string `json:"node_id"`
+	}
+	if err := decode(r, &in); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	n, err := e.st.node(r.Context(), in.NodeID)
+	if err != nil || n.CourseID != c.ID {
+		jsonErr(w, http.StatusNotFound, "no such idea on the map")
+		return
+	}
+	_ = e.st.updateCourse(r.Context(), c.ID, map[string]any{"steer": n.Title})
+	// Make room: drop what's queued but not yet heard, so the next segment is about this.
+	pos, _ := e.st.ownerPosition(r.Context(), c)
+	nDiscarded, _ := e.st.discardAfter(r.Context(), c.ID, pos, "")
+	e.poke()
+	jsonOK(w, map[string]any{"steer": n.Title, "discarded": nDiscarded})
+}
+
+func (e *Engine) listNotes(w http.ResponseWriter, r *http.Request) {
+	ns, err := e.st.notes(r.Context(), courseOf(r).ID, nil, true, 500)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ns == nil {
+		ns = []*Note{}
+	}
+	jsonOK(w, ns)
+}
+
+func (e *Engine) patchNote(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Resolved bool `json:"resolved"`
+		Delete   bool `json:"delete"`
+	}
+	if err := decode(r, &in); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := e.st.setNote(r.Context(), courseOf(r).ID, r.PathValue("nid"), in.Resolved, in.Delete); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonOK(w, map[string]bool{"ok": true})
+}
+
+// publicQuiz hides answer keys until the quiz has been submitted.
+func publicQuiz(q *Quiz) *Quiz {
+	if q.Status != "ready" && q.Status != "writing" {
+		return q
+	}
+	var qs []quizQuestion
+	if json.Unmarshal(q.Questions, &qs) == nil {
+		for k := range qs {
+			qs[k].Answer, qs[k].Explain, qs[k].ModelAnswer, qs[k].Rubric = -1, "", "", ""
+		}
+		cp := *q
+		cp.Questions, _ = json.Marshal(qs)
+		return &cp
+	}
+	return q
+}
+
+func (e *Engine) listQuizzes(w http.ResponseWriter, r *http.Request) {
+	qs, err := e.st.quizzes(r.Context(), courseOf(r).ID, 30)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := []*Quiz{}
+	for _, q := range qs {
+		out = append(out, publicQuiz(q))
+	}
+	jsonOK(w, out)
+}
+
+func (e *Engine) newQuiz(w http.ResponseWriter, r *http.Request) {
+	c := courseOf(r)
+	var in struct {
+		NodeID string `json:"node_id"`
+	}
+	_ = decode(r, &in)
+	if c.Status != StatusActive {
+		jsonErr(w, http.StatusConflict, "listen for a bit first; quizzes cover what you've heard")
+		return
+	}
+	q := &Quiz{CourseID: c.ID, NodeID: in.NodeID, Status: "writing"}
+	if err := e.st.addQuiz(r.Context(), q); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := e.st.enqueue(r.Context(), c.ID, "quiz", 85, map[string]string{"quiz_id": q.ID}); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	e.poke()
+	writeJSON(w, http.StatusAccepted, q)
+}
+
+func (e *Engine) getQuiz(w http.ResponseWriter, r *http.Request) {
+	q, err := e.st.quiz(r.Context(), r.PathValue("qid"))
+	if err != nil || q.CourseID != courseOf(r).ID {
+		jsonErr(w, http.StatusNotFound, "no such quiz")
+		return
+	}
+	jsonOK(w, publicQuiz(q))
+}
+
+func (e *Engine) answerQuiz(w http.ResponseWriter, r *http.Request) {
+	c := courseOf(r)
+	q, err := e.st.quiz(r.Context(), r.PathValue("qid"))
+	if err != nil || q.CourseID != c.ID {
+		jsonErr(w, http.StatusNotFound, "no such quiz")
+		return
+	}
+	if q.Status != "ready" {
+		jsonErr(w, http.StatusConflict, "this quiz has already been answered")
+		return
+	}
+	var in struct {
+		Answers []json.RawMessage `json:"answers"`
+	}
+	if err := decode(r, &in); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := e.submitQuiz(r.Context(), c, q, in.Answers); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	e.poke()
+	q, _ = e.st.quiz(r.Context(), q.ID)
+	jsonOK(w, q)
+}

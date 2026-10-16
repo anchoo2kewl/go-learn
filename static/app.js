@@ -47,14 +47,26 @@
   }
 
   let me = null, voices = [];
+  function deviceName() {
+    const ua = navigator.userAgent;
+    const kind = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? "iPad"
+      : /Android/.test(ua) ? "Android" : /Macintosh/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows PC" : "another device";
+    return kind;
+  }
+  const device = (() => {
+    let id = store.get("device", "");
+    if (!id) { id = Math.random().toString(36).slice(2, 8); store.set("device", id); }
+    return deviceName() + " · " + id;
+  })();
+  const deviceLabel = (d) => (d || "another device").split(" · ")[0];
   let timers = [];
   function clearTimers() { timers.forEach(clearInterval); timers = []; }
 
   // ---------- routing ----------
   async function route() {
     clearTimers();
-    const m = location.hash.match(/^#\/c\/([0-9a-f]+)/);
-    if (m) return courseView(m[1]);
+    const m = location.hash.match(/^#\/c\/([0-9a-z]+)(?:\/(\w+))?/);
+    if (m) { if (m[2]) store.set("tab", m[2]); if (view && m[2]) view.tab = m[2]; return courseView(m[1]); }
     player.detach();
     return topicsView();
   }
@@ -72,7 +84,9 @@
     document.title = (me && me.title) || "Learn";
     const list = h("div", { class: "topics" }, h("p", { class: "muted" }, "Loading your topics…"));
     const formBox = h("div");
+    const inHub = location.pathname.startsWith("/learn/");
     app.replaceChildren(
+      inHub ? h("a", { href: "/", class: "small" }, "← Hub") : null,
       h("header", { class: "spread" },
         h("div", {}, h("div", { class: "eyebrow" }, "Audio courses"), h("h1", {}, "What are you learning?")),
         h("button", { class: "primary", onclick: () => { formBox.replaceChildren(newTopicForm()); formBox.scrollIntoView({ behavior: "smooth" }); } }, "New topic")),
@@ -201,13 +215,37 @@
       body.push(h("div", { class: "panel" }, h("p", {}, "Something went wrong setting this up."), h("p", { class: "muted small" }, c.error),
         d.can_steer ? h("button", { class: "primary", onclick: async () => { await api("courses/" + c.id + "/retry", { method: "POST" }); refreshCourse(true); } }, "Try again") : null));
     } else if (c.status === "active") {
-      body.push(playerSection(d));
-      if (d.can_steer) body.push(askSection());
-      body.push(els.qa = h("section", { class: "panel" }, h("h2", {}, "Your questions"), h("p", { class: "muted small" }, "Nothing asked yet.")));
-      body.push(outlineSection(d));
-      if (d.can_steer) body.push(settingsSection(d));
+      const tabs = [["listen", "Listen"], ["map", "Mind map"]];
+      if (d.can_steer) tabs.push(["quiz", "Quiz"], ["questions", "Questions"], ["you", "About you"], ["settings", "Settings"]);
+      const panes = {};
+      panes.listen = h("div", { class: "stack" }, playerSection(d), d.can_steer ? askSection() : null,
+        els.qa = h("section", { class: "panel" }, h("h2", {}, "Latest questions"), h("p", { class: "muted small" }, "Nothing asked yet.")));
+      panes.map = mindMapSection(d);
+      if (d.can_steer) {
+        panes.quiz = els.quiz = h("div", { class: "stack" });
+        panes.questions = els.allq = h("div", { class: "stack" });
+        panes.you = els.you = h("div", { class: "stack" });
+        panes.settings = settingsSection(d);
+      }
+      const bar = h("nav", { class: "tabs", role: "tablist", "aria-label": "Course" });
+      const show = (k) => {
+        view.tab = k; store.set("tab", k);
+        for (const [key] of tabs) {
+          panes[key].hidden = key !== k;
+          bar.querySelector('[data-tab="' + key + '"]').setAttribute("aria-selected", String(key === k));
+        }
+        if (k === "quiz") renderQuizTab();
+        if (k === "questions") renderAllQuestions();
+        if (k === "you") renderAboutYou();
+        if (k === "map") drawMindMap();
+      };
+      view.show = show;
+      for (const [key, label] of tabs) bar.append(h("button", { role: "tab", "data-tab": key, onclick: () => show(key) }, label));
+      body.push(bar, ...tabs.map(([k]) => panes[k]));
+      view.afterRender = () => show(tabs.some(([k]) => k === view.tab) ? view.tab : (tabs.some(([k]) => k === store.get("tab", "listen")) ? store.get("tab", "listen") : "listen"));
     }
     app.replaceChildren(...body);
+    if (view.afterRender) { view.afterRender(); view.afterRender = null; }
     updateLive();
     if (c.status === "active") {
       player.attach(view.id, d);
@@ -228,7 +266,7 @@
       els.meta.textContent = bits.filter(Boolean).join(" · ");
       if (c.error && c.status === "active") els.meta.append(h("div", { style: "color:var(--warn)" }, c.error));
     }
-    if (els.outline) els.outline.replaceChildren(...outlineItems(d));
+    if (view.tab === "map") drawMindMap();
   }
 
   function voiceLabel(id) { const v = voices.find((x) => x.id === id); return v ? v.label : id; }
@@ -337,8 +375,7 @@
       const st = i.status === "pending" ? h("span", { class: "pill busy" }, h("span", { class: "spinner" }), "answering")
         : i.status === "failed" ? h("span", { class: "pill bad" }, "failed") : h("span", { class: "pill live" }, i.verdict ? i.verdict : "answered");
       const play = i.answer_segment_id ? h("button", { class: "quiet small", onclick: () => player.jumpTo(i.answer_segment_id) }, "Play answer") : null;
-      qa.append(h("div", { class: "qa" }, h("div", { class: "spread" }, h("span", { class: "muted small" }, i.kind === "checkin" ? "Check-in answer" : "You asked"), st),
-        h("div", {}, i.text), play));
+      qa.append(qaItem(i, st, play));
       if (i.status === "pending") pendingAsks.add(i.id);
       else if (pendingAsks.has(i.id)) {
         pendingAsks.delete(i.id);
@@ -351,18 +388,243 @@
     }
   }
 
-  // ---------- outline ----------
-  function outlineSection(d) {
-    view.els.outline = h("div", { class: "outline" });
-    return h("section", { class: "panel" }, h("h2", {}, "Curriculum"), h("p", { class: "muted small" }, "Bars show how well you know each concept, from your answers and questions. It grows as you go."), view.els.outline);
+  function conceptTitle(id) { const n = view.data.nodes.find((x) => x.id === id); return n ? n.title : ""; }
+  function qaItem(i, st, play) {
+    const about = i.node_id ? conceptTitle(i.node_id) : "";
+    return h("div", { class: "qa" }, h("div", { class: "spread" },
+      h("span", { class: "muted small" }, (i.kind === "checkin" ? "Check-in answer" : "You asked") + (about ? " · " + about : "") + " · " + new Date(i.created_at).toLocaleString()), st),
+      h("div", {}, i.text), play);
   }
-  function outlineItems(d) {
-    const cur = player.currentSeg();
+
+  // ---------- mind map ----------
+  function mindMapSection(d) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "mindmap");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Mind map of the topic");
+    view.els.map = svg;
+    view.els.mapDetail = h("div", { class: "panel", hidden: true });
+    const zoom = (f) => { const vb = view.mapVB; if (!vb) return; const cx = vb[0] + vb[2] / 2, cy = vb[1] + vb[3] / 2; vb[2] *= f; vb[3] *= f; vb[0] = cx - vb[2] / 2; vb[1] = cy - vb[3] / 2; svg.setAttribute("viewBox", vb.join(" ")); };
+    // Drag to pan, pinch or wheel to zoom.
+    let drag = null;
+    svg.addEventListener("pointerdown", (e) => { if (e.target.closest(".mm-concept")) return; drag = { x: e.clientX, y: e.clientY, vb: view.mapVB.slice() }; svg.setPointerCapture(e.pointerId); });
+    svg.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const k = view.mapVB[2] / svg.clientWidth;
+      view.mapVB[0] = drag.vb[0] - (e.clientX - drag.x) * k; view.mapVB[1] = drag.vb[1] - (e.clientY - drag.y) * k;
+      svg.setAttribute("viewBox", view.mapVB.join(" "));
+    });
+    svg.addEventListener("pointerup", () => (drag = null));
+    svg.addEventListener("wheel", (e) => { e.preventDefault(); zoom(e.deltaY > 0 ? 1.12 : 0.89); }, { passive: false });
+    return h("section", { class: "stack" },
+      h("div", { class: "spread" }, h("p", { class: "muted small", style: "margin:0;max-width:52ch" },
+        "Not a book: what plays next depends on you, and ideas come back from new angles. Darker means you know it better; bigger means you've heard it more. Tap an idea."),
+        h("div", { class: "row" }, h("button", { onclick: () => zoom(0.8), "aria-label": "Zoom in" }, "+"), h("button", { onclick: () => zoom(1.25), "aria-label": "Zoom out" }, "−"), h("button", { onclick: () => drawMindMap(true) }, "Fit"))),
+      h("div", { class: "mapbox" }, svg), view.els.mapDetail);
+  }
+
+  function drawMindMap(refit) {
+    const svg = view.els && view.els.map;
+    if (!svg) return;
+    const d = view.data, NS = "http://www.w3.org/2000/svg";
+    const el = (t, a, txt) => { const x = document.createElementNS(NS, t); for (const k in a) x.setAttribute(k, a[k]); if (txt != null) x.textContent = txt; return x; };
     const mods = d.nodes.filter((n) => n.kind === "module");
-    return mods.map((m) => h("div", { class: "module" },
-      h("div", { class: "eyebrow" }, m.title),
-      ...d.nodes.filter((n) => n.parent_id === m.id).map((n) => h("div", { class: "concept" + (n.status === "done" ? " done" : "") + (cur && cur.node_id === n.id ? " now" : "") },
-        h("span", { class: "ctitle" }, n.title), h("div", { class: "meter", title: "mastery " + Math.round(n.mastery * 100) + "%" }, h("i", { style: "width:" + Math.round(n.mastery * 100) + "%" }))))));
+    const concepts = d.nodes.filter((n) => n.kind === "concept");
+    const cur = player.currentSeg();
+    const total = Math.max(1, concepts.length);
+    const R1 = 230, R2 = Math.max(400, total * 15);
+    svg.replaceChildren();
+    const g = el("g", {});
+    svg.append(g);
+    let start = -Math.PI / 2;
+    const center = el("g", {});
+    center.append(el("circle", { cx: 0, cy: 0, r: 92, class: "mm-root" }));
+    const words = (d.course.title || d.course.topic).split(/\s+/);
+    const lines = []; let line = "";
+    for (const w of words) { if ((line + " " + w).trim().length > 14 && line) { lines.push(line); line = w; } else line = (line + " " + w).trim(); }
+    if (line) lines.push(line);
+    lines.slice(0, 4).forEach((l, i) => center.append(el("text", { x: 0, y: (i - (Math.min(lines.length, 4) - 1) / 2) * 26 + 8, class: "mm-root-text", "text-anchor": "middle" }, l)));
+    for (const m of mods) {
+      const kids = concepts.filter((n) => n.parent_id === m.id);
+      const span = (Math.max(1, kids.length) / total) * Math.PI * 2;
+      const mid = start + span / 2;
+      const mx = Math.cos(mid) * R1, my = Math.sin(mid) * R1;
+      g.append(el("line", { x1: 0, y1: 0, x2: mx, y2: my, class: "mm-edge" }));
+      kids.forEach((n, i) => {
+        const a = start + span * ((i + 0.5) / Math.max(1, kids.length));
+        const x = Math.cos(a) * R2, y = Math.sin(a) * R2;
+        g.append(el("path", { d: "M" + mx + "," + my + " Q" + Math.cos(a) * (R1 + 120) + "," + Math.sin(a) * (R1 + 120) + " " + x + "," + y, class: "mm-edge" }));
+        const node = el("g", { class: "mm-concept" + (cur && cur.node_id === n.id ? " now" : "") + (view.mapSel === n.id ? " sel" : ""), tabindex: 0, role: "button", "aria-label": n.title });
+        const r = 10 + Math.min(18, n.covered * 3);
+        node.append(el("circle", { cx: x, cy: y, r, style: "fill-opacity:" + (0.15 + 0.85 * n.mastery).toFixed(2) }));
+        const deg = (a * 180) / Math.PI, flip = Math.cos(a) < 0;
+        const tx = x + Math.cos(a) * (r + 10), ty = y + Math.sin(a) * (r + 10);
+        const label = n.title.length > 42 ? n.title.slice(0, 40) + "…" : n.title;
+        node.append(el("text", { x: tx, y: ty, dy: "0.35em", "text-anchor": flip ? "end" : "start", transform: "rotate(" + (flip ? deg + 180 : deg) + " " + tx + " " + ty + ")" }, label));
+        node.addEventListener("click", () => selectConcept(n));
+        node.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectConcept(n); } });
+        g.append(node);
+      });
+      const mnode = el("g", { class: "mm-module" });
+      mnode.append(el("circle", { cx: mx, cy: my, r: 16 }));
+      const ml = m.title.length > 26 ? m.title.slice(0, 24) + "…" : m.title;
+      mnode.append(el("text", { x: mx, y: my - 26, "text-anchor": "middle" }, ml));
+      g.append(mnode);
+      start += span;
+    }
+    g.append(center);
+    if (refit || !view.mapVB) {
+      // Fit what was actually drawn (labels included), with a little margin.
+      let bb = null;
+      try { bb = g.getBBox(); } catch {}
+      const ext = R2 + 470;
+      view.mapVB = bb && bb.width ? [bb.x - 24, bb.y - 24, bb.width + 48, bb.height + 48] : [-ext, -ext, ext * 2, ext * 2];
+    }
+    svg.setAttribute("viewBox", view.mapVB.join(" "));
+  }
+
+  async function selectConcept(n) {
+    view.mapSel = n.id; drawMindMap();
+    const box = view.els.mapDetail;
+    box.hidden = false;
+    const can = view.data.can_steer;
+    const notesBox = h("div", { class: "small" });
+    box.replaceChildren(h("div", { class: "spread" }, h("h2", {}, n.title), h("button", { class: "quiet small", onclick: () => { box.hidden = true; view.mapSel = null; drawMindMap(); } }, "Close")),
+      n.summary ? h("p", { class: "muted small", style: "margin:0" }, n.summary) : null,
+      h("div", { class: "row small" }, h("span", {}, "Mastery " + Math.round(n.mastery * 100) + "%"), h("span", { class: "muted" }, n.covered ? "heard " + n.covered + "×, last " + new Date(n.last_covered_at).toLocaleDateString() : "not covered yet"),
+        n.correct_recalls ? h("span", { class: "muted" }, n.correct_recalls + " correct recall" + (n.correct_recalls > 1 ? "s" : "")) : null),
+      can ? h("div", { class: "row" },
+        h("button", { class: "primary", onclick: async () => { try { await api("courses/" + view.id + "/focus", { method: "POST", body: { node_id: n.id } }); toast("Next up: " + n.title + ". It plays after the current segment."); player.refreshQueue(); } catch (e) { toast(e.message); } } }, "Teach this next"),
+        h("button", { onclick: () => startQuiz(n.id) }, "Quiz me on this")) : null,
+      notesBox);
+    if (can) {
+      try {
+        const notes = (await api("courses/" + view.id + "/notes")).filter((x) => x.node_id === n.id);
+        if (notes.length) notesBox.replaceChildren(h("div", { class: "eyebrow" }, "What Learn knows about you here"), ...notes.map((x) => h("div", { class: x.resolved ? "muted" : "" }, x.kind + ": " + x.text + (x.resolved ? " (resolved)" : ""))));
+      } catch {}
+    }
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  // ---------- quiz ----------
+  async function startQuiz(nodeId) {
+    try {
+      const q = await api("courses/" + view.id + "/quizzes", { method: "POST", body: { node_id: nodeId || "" } });
+      view.quizId = q.id;
+      if (view.show) view.show("quiz");
+    } catch (e) { toast(e.message); }
+  }
+
+  async function renderQuizTab() {
+    const box = view.els.quiz;
+    if (!box) return;
+    let list = [];
+    try { list = await api("courses/" + view.id + "/quizzes"); } catch (e) { box.replaceChildren(h("p", {}, e.message)); return; }
+    const active = list.find((q) => q.id === view.quizId) || list.find((q) => q.status === "writing" || q.status === "ready" || q.status === "grading");
+    const head = h("div", { class: "spread" }, h("div", {}, h("h2", {}, "Quiz"), h("p", { class: "muted small", style: "margin:4px 0 0" }, "Five questions on what you've heard, leaning on what you find hardest. Results update the mind map.")),
+      h("button", { class: "primary", onclick: () => startQuiz("") }, "New quiz"));
+    const parts = [head];
+    if (active) parts.push(quizView(active));
+    const past = list.filter((q) => q.status === "done" && (!active || q.id !== active.id)).slice(0, 10);
+    if (past.length) parts.push(h("section", { class: "panel" }, h("h2", {}, "Earlier quizzes"),
+      ...past.map((q) => h("button", { class: "quiet", style: "text-align:left", onclick: () => { view.quizId = q.id; renderQuizTab(); } },
+        new Date(q.created_at).toLocaleString() + " · " + Math.round(q.score * 100) + "%"))));
+    box.replaceChildren(...parts);
+    if (active && (active.status === "writing" || active.status === "grading")) setTimeout(() => { if (view && view.tab === "quiz") renderQuizTab(); }, 4000);
+  }
+
+  function quizView(q) {
+    if (q.status === "writing") return h("div", { class: "panel" }, h("p", {}, h("span", { class: "spinner" }), " Writing your quiz…"));
+    if (q.status === "failed") return h("div", { class: "panel" }, h("p", {}, "Couldn't write this quiz: " + q.error));
+    const qs = q.questions || [], results = q.results || [], answers = q.answers || [];
+    const done = q.status === "done" || q.status === "grading";
+    const picks = qs.map((_, i) => (answers[i] !== undefined ? answers[i] : null));
+    const form = h("form", { class: "stack" });
+    qs.forEach((qq, i) => {
+      const r = results[i];
+      const card = h("div", { class: "panel quizq" + (r ? " " + r.verdict : "") },
+        h("div", { class: "eyebrow" }, (i + 1) + " of " + qs.length + (qq.concept ? " · " + qq.concept : "")),
+        h("p", { style: "margin:0;font-family:var(--font-read);font-size:1.1rem" }, qq.q));
+      if (qq.type === "mc") {
+        const opts = h("div", { class: "stack", style: "gap:8px" });
+        qq.options.forEach((o, k) => {
+          const b = h("button", { type: "button", class: "opt" + (picks[i] === k ? " picked" : "") + (done && k === qq.answer ? " right" : "") + (done && picks[i] === k && k !== qq.answer ? " wrongpick" : ""), disabled: done,
+            onclick: () => { picks[i] = k; opts.querySelectorAll(".opt").forEach((x, j) => x.classList.toggle("picked", j === k)); } }, o);
+          opts.append(b);
+        });
+        card.append(opts);
+      } else {
+        const ta = h("textarea", { placeholder: "Answer in a sentence or two", disabled: done });
+        ta.value = typeof picks[i] === "string" ? picks[i] : "";
+        ta.addEventListener("input", () => (picks[i] = ta.value));
+        card.append(h("div", { class: "row", style: "flex-wrap:nowrap;align-items:start" }, ta, done ? null : micButton((t) => { ta.value = (ta.value ? ta.value + " " : "") + t; picks[i] = ta.value; })));
+        if (done && qq.model_answer) card.append(h("p", { class: "muted small", style: "margin:0" }, "A good answer: " + qq.model_answer));
+      }
+      if (r) card.append(h("p", { class: "small", style: "margin:0" }, h("b", {}, r.verdict === "pending" ? "Grading…" : r.verdict[0].toUpperCase() + r.verdict.slice(1) + ". "), r.feedback || ""));
+      form.append(card);
+    });
+    if (!done) {
+      form.append(h("div", { class: "row" }, h("button", { class: "primary", type: "submit" }, "Check my answers")));
+      form.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        if (picks.some((p) => p === null || p === "")) { toast("Answer every question first (a guess is fine)."); return; }
+        try { await api("courses/" + view.id + "/quizzes/" + q.id + "/answers", { method: "POST", body: { answers: picks } }); view.quizId = q.id; renderQuizTab(); refreshCourse(false); }
+        catch (e) { toast(e.message); }
+      });
+    } else {
+      form.prepend(h("div", { class: "panel" }, h("b", {}, q.status === "grading" ? "Marking your written answers…" : "Score: " + Math.round(q.score * 100) + "%"),
+        h("p", { class: "muted small", style: "margin:0" }, "Correct answers raise mastery; a concept counts as mastered after two correct recalls on different days.")));
+    }
+    return form;
+  }
+
+  // ---------- all questions ----------
+  async function renderAllQuestions() {
+    const box = view.els.allq;
+    if (!box) return;
+    let is = [];
+    try { is = await api("courses/" + view.id + "/interactions?all=1"); } catch (e) { box.replaceChildren(h("p", {}, e.message)); return; }
+    const filter = h("input", { type: "text", placeholder: "Filter your questions", autocomplete: "off" });
+    const list = h("section", { class: "panel" });
+    const draw = () => {
+      const f = filter.value.toLowerCase();
+      const rows = is.filter((i) => !f || i.text.toLowerCase().includes(f) || conceptTitle(i.node_id).toLowerCase().includes(f));
+      list.replaceChildren(h("h2", {}, rows.length + " question" + (rows.length === 1 ? "" : "s")),
+        ...(rows.length ? rows.map((i) => qaItem(i, i.status === "pending" ? h("span", { class: "pill busy" }, "answering") : h("span", { class: "pill" + (i.status === "failed" ? " bad" : " live") }, i.verdict || i.status),
+          i.answer_segment_id ? h("button", { class: "quiet small", onclick: () => { player.jumpTo(i.answer_segment_id); view.show("listen"); } }, "Play answer") : null)) : [h("p", { class: "muted small" }, "Nothing yet. Ask from the Listen tab, typed or spoken.")]));
+    };
+    filter.addEventListener("input", draw);
+    box.replaceChildren(h("p", { class: "muted small", style: "margin:0" }, "Everything you've asked or answered, tagged to the idea it was about. Each one feeds what Learn knows about you."), filter, list);
+    draw();
+  }
+
+  // ---------- about you ----------
+  async function renderAboutYou() {
+    const box = view.els.you;
+    if (!box) return;
+    let notes = [];
+    try { notes = await api("courses/" + view.id + "/notes"); } catch {}
+    const prof = view.data.course.profile || {};
+    const listOf = (k, label) => Array.isArray(prof[k]) && prof[k].length ? h("div", {}, h("div", { class: "eyebrow" }, label), h("ul", { class: "small" }, ...prof[k].map((x) => h("li", {}, typeof x === "string" ? x : JSON.stringify(x))))) : null;
+    const profile = h("section", { class: "panel" }, h("h2", {}, "Your profile on this topic"),
+      prof.level ? h("p", { style: "margin:0" }, h("b", {}, "Level: "), prof.level) : null,
+      prof.pitch ? h("p", { class: "muted small", style: "margin:0" }, "How I teach you: " + prof.pitch) : null,
+      listOf("knows", "You know"), listOf("gaps", "Gaps"), listOf("misconceptions", "Watch-outs"),
+      !Object.keys(prof).length ? h("p", { class: "muted small" }, "Builds up as you listen, ask and answer.") : null);
+    const kinds = { misconception: "Misconceptions", gap: "Gaps", strength: "Strengths", interest: "Interests", preference: "Preferences", note: "Notes" };
+    const groups = Object.keys(kinds).map((k) => {
+      const ns = notes.filter((n) => n.kind === k);
+      if (!ns.length) return null;
+      return h("section", { class: "panel" }, h("h2", {}, kinds[k]),
+        ...ns.map((n) => h("div", { class: "qa" },
+          h("div", { class: n.resolved ? "muted" : "" }, n.text, n.resolved ? " (resolved)" : ""),
+          h("div", { class: "spread" }, h("span", { class: "muted small" }, (conceptTitle(n.node_id) || "general") + " · from " + (n.source || "listening") + " · " + new Date(n.created_at).toLocaleDateString()),
+            h("div", { class: "row" },
+              h("button", { class: "quiet small", onclick: async () => { await api("courses/" + view.id + "/notes/" + n.id, { method: "PATCH", body: { resolved: !n.resolved } }); renderAboutYou(); } }, n.resolved ? "Reopen" : "Resolved"),
+              h("button", { class: "quiet small danger", onclick: async () => { await api("courses/" + view.id + "/notes/" + n.id, { method: "PATCH", body: { delete: true } }); renderAboutYou(); } }, "Wrong, remove"))))));
+    });
+    box.replaceChildren(h("p", { class: "muted small", style: "margin:0" }, "What Learn has picked up about you from your questions, check-ins and quizzes. Only the notes relevant to what's playing are used each time. Remove anything that's wrong."), profile, ...groups.filter(Boolean),
+      notes.length ? null : h("p", { class: "muted small" }, "No notes yet."));
   }
 
   // ---------- settings ----------
@@ -453,7 +715,7 @@
       const at = resumeAt; resumeAt = 0;
       audio.onloadedmetadata = () => { if (at > 0 && at < audio.duration - 1) audio.currentTime = at; audio.playbackRate = SPEEDS[speedIdx]; };
       renderReader(); renderBar(); setMediaSession();
-      if (view && view.els && view.els.outline) view.els.outline.replaceChildren(...outlineItems(view.data));
+      if (view && view.tab === "map") drawMindMap();
       if (autoplay) audio.play().catch(() => {});
     }
 
@@ -484,15 +746,63 @@
       } catch (e) { toast(e.message); }
     }
 
+    let lastOwnSave = "", lastSeen = "";
     async function save(finishedId, finished) {
       if (!cur || !courseId) return;
       lastSave = Date.now();
       try {
-        await api("courses/" + courseId + "/playback", { method: "PUT", body: {
+        const r = await api("courses/" + courseId + "/playback", { method: "PUT", body: {
           segment_id: cur.id, offset_ms: finished ? Math.round((audio.duration || 0) * 1000) : Math.round(audio.currentTime * 1000),
-          rate: SPEEDS[speedIdx], finished: finished ? finishedId : "" } });
+          rate: SPEEDS[speedIdx], finished: finished ? finishedId : "", device } });
+        if (r && r.updated_at) lastOwnSave = r.updated_at;
       } catch {}
     }
+
+    // Handoff between devices. A background poll only notes where another device is; this one jumps
+    // there when you come back to it or press play, and a device that's playing steps aside at once.
+    let remote = null, steppedAside = "";
+    const newer = (pb) => pb && pb.segment_id && pb.device !== device && pb.updated_at > lastOwnSave && pb.updated_at > lastSeen;
+    async function sync(trigger) {
+      if (!courseId || !attached) return;
+      let pb;
+      try { pb = await api("courses/" + courseId + "/playback"); } catch { return; }
+      if (!newer(pb)) return;
+      remote = pb;
+      if (!audio.paused) {
+        audio.pause();
+        if (steppedAside !== pb.updated_at) {
+          steppedAside = pb.updated_at;
+          toast("You're listening on your " + deviceLabel(pb.device) + ", so this one paused.", "Play here", () => takeOver(pb, true), 10000);
+        }
+        return;
+      }
+      if (trigger === "visible") {
+        await takeOver(pb, false);
+        toast("Picked up where you left off on your " + deviceLabel(pb.device) + ".");
+      } else {
+        $("bar-sub").textContent = "Playing on your " + deviceLabel(pb.device) + " · press Play to continue here";
+      }
+    }
+    async function takeOver(pb, play) {
+      lastSeen = pb.updated_at; remote = null;
+      if (cur && pb.segment_id === cur.id) {
+        audio.currentTime = (pb.offset_ms || 0) / 1000;
+        if (play) audio.play().catch(() => {});
+        return;
+      }
+      try {
+        const g = await api("courses/" + courseId + "/segments/" + pb.segment_id);
+        cur = g; resumeAt = (pb.offset_ms || 0) / 1000;
+        load(play); refreshQueueSoon();
+      } catch (e) { toast(e.message); }
+    }
+    function play() {
+      if (newer(remote)) return takeOver(remote, true);
+      audio.play().catch((e) => toast(e.message));
+    }
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") sync("visible"); });
+    addEventListener("focus", () => sync("visible"));
+    setInterval(() => sync("poll"), 15000);
 
     function setMode(m) {
       mode = m; store.set("mode", m);
@@ -581,7 +891,6 @@
       const d = audio.duration || 0;
       $("time").textContent = fmt(audio.currentTime) + " / " + fmt(d);
       if (d && !seeking) $("seek").value = String(Math.round((audio.currentTime / d) * 1000));
-      if (!audio.paused && Date.now() - lastSave > 10000) save();
       requestAnimationFrame(tick);
     }
     requestAnimationFrame(tick);
@@ -598,12 +907,13 @@
     $("back").onclick = () => { userScrolled = false; $("back").hidden = true; if (spans[lit]) spans[lit].scrollIntoView({ block: "center", behavior: "smooth" }); };
 
     audio.addEventListener("ended", () => advance(true));
-    audio.addEventListener("play", () => { $("play").textContent = "Pause"; if (mode === "read") setMode("both"); });
+    audio.addEventListener("timeupdate", () => { if (!audio.paused && Date.now() - lastSave > 10000) save(); });
+    audio.addEventListener("play", () => { $("play").textContent = "Pause"; if (mode === "read") setMode("both"); save(); });
     audio.addEventListener("pause", () => { $("play").textContent = "Play"; save(); });
     audio.addEventListener("error", () => { if (cur) toast("Couldn't play this segment; skipping it.", null, null, 4000); setTimeout(() => advance(true), 1500); });
     document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") save(); });
 
-    $("play").onclick = () => { if (!cur) return; audio.paused ? audio.play().catch((e) => toast(e.message)) : audio.pause(); };
+    $("play").onclick = () => { if (!cur) return; audio.paused ? play() : audio.pause(); };
     $("rew").onclick = () => { audio.currentTime = Math.max(0, audio.currentTime - 15); };
     $("fwd").onclick = () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 15); };
     $("next").onclick = () => advance(!audio.paused);
