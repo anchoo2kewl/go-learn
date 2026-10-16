@@ -1,5 +1,7 @@
 """M0 voice bake-off: render one script with several engines and voices, time it, and check it.
 
+Run with the sidecar's Python: ../../sidecar/.venv/bin/python bakeoff.py ...
+
     python bakeoff.py refs                 design the four reference voices (Qwen3-TTS VoiceDesign)
     python bakeoff.py render --set excerpt [--engine E] [--voice V]
     python bakeoff.py render --set full    [--engine E] [--voice V]
